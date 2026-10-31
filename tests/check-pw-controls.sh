@@ -7,11 +7,14 @@ fixture=$2
 work=$3
 mkdir -p "$work/runtime" "$work/config";chmod 700 "$work/runtime"
 export LC_ALL=C XDG_CONFIG_HOME="$work/config"
-export XDG_RUNTIME_DIR="$work/runtime" PIPEWIRE_RUNTIME_DIR="$work/runtime" PIPEWIRE_REMOTE=effects-test
+export XDG_RUNTIME_DIR="$work/runtime" PIPEWIRE_RUNTIME_DIR="$work/runtime" PIPEWIRE_REMOTE=pipewire-0  # PipeWire >= 1.4 names the socket from module-protocol-native, not core.name
 pids=()
 cleanup() { for pid in "${pids[@]}"; do kill "$pid" 2>/dev/null || true; done; wait || true; }
 trap cleanup EXIT
-pipewire -c pipewire.conf -P '{ core.name = effects-test }' > "$work/server.log" 2>&1 & pids+=($!)
+# Only the stock server config: distro drop-ins (AirPlay discovery, device
+# quirks) slow start-up past the wait below and reach outside the test.
+mkdir -p "$work/pwconf"; cp /usr/share/pipewire/pipewire.conf "$work/pwconf/"
+PIPEWIRE_CONFIG_DIR="$work/pwconf" pipewire -c pipewire.conf -P '{ core.name = effects-test }' > "$work/server.log" 2>&1 & pids+=($!)
 for i in $(seq 1 100); do if pw-cli info 0 >/dev/null 2>&1; then break; fi; sleep .05; done
 "$fixture" > "$work/fixture.log" 2>&1 & pids+=($!)
 "$filter" --stream callA --mode off > "$work/A.log" 2>&1 & pids+=($!)
@@ -49,8 +52,9 @@ PY
 
 timeout 12 "$fixture" --sink > "$work/sink.log" 2>&1 & sink=$!;pids+=("$sink")
 for i in $(seq 1 100); do if pw-link -i | grep -q effects-test-sink; then break; fi; sleep .05; done
-pw-link aurora_camera_denoise.callA.camera-effects-fixture:out_0 effects-test-sink:in_0
+# Link by node: port names differ between PipeWire releases (out_0, capture_1).
+pw-link aurora_camera_denoise.callA.camera-effects-fixture effects-test-sink
 for i in $(seq 1 100); do if pw-link -i | grep -q aurora_camera_denoise.input; then break; fi; sleep .05; done
-pw-link camera-effects-fixture:out_0 aurora_camera_denoise.input:in_0
+pw-link camera-effects-fixture aurora_camera_denoise.input
 wait "$sink"
 cat "$work/sink.log"
