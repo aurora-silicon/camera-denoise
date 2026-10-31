@@ -57,6 +57,22 @@ int main(int argc, char **argv)
     CHECK(c.framing.supported && c.framing.minimum == 1 && c.framing.maximum == 6 && c.framing.default_zoom == 1.5f);
     f = fopen(boards, "a"); fputs("framing-zoom-default = 7\n", f); fclose(f);
     CHECK(cdn_config_load(&c, compat, boards, NULL, 0) != 0);
+	/* A user may opt in to framing on a board without framing data. */
+	{
+		char optin[512];
+		snprintf(optin, sizeof(optin), "%s/framing-optin.conf", dir);
+		f = fopen(optin, "w");
+		fputs("[denoise]\nframing-supported = true\nframing-zoom-min = 1\nframing-zoom-max = 2\nframing-zoom-default = 1\n", f);
+		fclose(f);
+		f = fopen(boards, "w"); fputs("[apple,j700]\nenter-gain = 2304\n", f); fclose(f);
+		const char *s3[] = { optin };
+		CHECK(cdn_config_load(&c, compat, boards, NULL, 0) == 0 && !c.framing.supported);
+		CHECK(cdn_config_load(&c, compat, boards, s3, 1) == 0);
+		CHECK(c.framing.supported && c.framing.minimum == 1 && c.framing.maximum == 2 && c.framing.default_zoom == 1);
+		f = fopen(optin, "a"); fputs("framing-zoom-max = 9\n", f); fclose(f);
+		CHECK(cdn_config_load(&c, compat, boards, s3, 1) != 0);
+		remove(optin);
+	}
 	remove(compat); remove(boards); remove(user); remove(bad);
 	printf(fails ? "FAIL\n" : "PASS\n");
 	return fails != 0;
