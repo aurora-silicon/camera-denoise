@@ -7,7 +7,7 @@
 #include <string.h>
 #include <time.h>
 static pthread_t main_thread;
-static _Atomic unsigned calls, resets;
+static _Atomic unsigned calls, resets, hold;
 struct state { unsigned value; size_t bytes; };
 static void *create(const struct ce_config *c)
 {
@@ -22,6 +22,7 @@ static int process(void *opaque, const uint8_t *in, uint8_t *out, uint64_t pts)
 	struct state *s = opaque;
 	assert(!pthread_equal(pthread_self(), main_thread));
 	assert(pts > 0);
+	while (atomic_load(&hold)) { struct timespec pause={0,1000000};nanosleep(&pause,NULL); }
 	memcpy(out, in, s->bytes);
 	out[0] = (uint8_t)s->value;
 	atomic_fetch_add(&calls, 1);
@@ -60,12 +61,21 @@ int main(void)
 	assert(cdn_effects_submit(a,&in,500,999)); /* Timestamp reversal resets crop history. */
 	assert(take(a,&out,&pts,&seq));
 	assert(pts==500 && seq==999 && atomic_load(&resets)>0);
+	assert(cdn_effects_submit(a,&in,2000000501,1000));
+	assert(take(a,&out,&pts,&seq));
+	unsigned before=atomic_load(&resets);
+	assert(before==2); /* Reversal and a gap over one second reset. */
 	/* Saturating a slow consumer stays bounded, preserves complete frames and
 	 * cannot reuse a ring slot still owned by the worker. */
-	for (unsigned i=0;i<2000;i++) cdn_effects_submit(a,&in,100000+i,i);
+	atomic_store(&hold,1);
+	unsigned dropped=0;
+	for (unsigned i=0;i<2000;i++) dropped+=!cdn_effects_submit(a,&in,2000100000+i,i);
+	assert(dropped>0);
+	atomic_store(&hold,0);
 	assert(take(a,&out,&pts,&seq));
 	assert(dst[0]==1 && dst[1]==77 && dst[48]==77);
 	cdn_effects_free(a); cdn_effects_free(b);
+	assert(atomic_load(&resets)==before); /* Ordinary admission/output drops preserve crop history. */
 	assert(atomic_load(&calls)>=4);
 	return 0;
 }

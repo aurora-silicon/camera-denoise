@@ -13,7 +13,7 @@
 #define CDN_BACKEND_DIR "/usr/lib/aurora-camera-denoise"
 #endif
 #define QUEUE 4u
-struct slot { uint8_t *data; uint64_t pts, seq, token, enqueued; };
+struct slot { uint8_t *data; uint64_t pts, seq, enqueued; };
 struct queue { _Atomic unsigned read, write; struct slot slots[QUEUE]; };
 struct cdn_effects {
 	struct ce_config cfg;
@@ -23,7 +23,6 @@ struct cdn_effects {
 	pthread_t worker;
 	sem_t wake;
 	_Atomic unsigned stop;
-	uint64_t token;
 };
 static uint64_t now_ns(void)
 {
@@ -57,7 +56,7 @@ static void *work(void *opaque)
 {
 	struct cdn_effects *s = opaque;
 	void *state = s->ops->create(&s->cfg);
-	uint64_t expected = 0, last_pts = 0;
+	uint64_t last_pts = 0;
 	int reported = 0;
 	if (!state) fprintf(stderr, "camera-effects: model initialization failed; frames pass through\n");
 	while (!atomic_load_explicit(&s->stop, memory_order_acquire)) {
@@ -71,8 +70,8 @@ static void *work(void *opaque)
 		unsigned or = atomic_load_explicit(&s->output.read, memory_order_acquire);
 		if (ow - or < QUEUE) {
 			struct slot *out = &s->output.slots[ow % QUEUE];
-			if (state && s->ops->reset && (in->token != expected ||
-				(last_pts && (in->pts <= last_pts || in->pts-last_pts > 1000000000u))))
+			if (state && s->ops->reset && last_pts &&
+				(in->pts <= last_pts || in->pts-last_pts > 1000000000u))
 				s->ops->reset(state);
 			int rc = state ? s->ops->process(state, in->data, out->data, in->pts) : -EIO;
 			if (rc) {
@@ -80,7 +79,7 @@ static void *work(void *opaque)
 				if (!reported++) fprintf(stderr, "camera-effects: inference failed (%d); frame passed through\n", rc);
 			}
 			out->pts = in->pts; out->seq = in->seq; out->enqueued = in->enqueued;
-			expected = in->token + 1; last_pts = in->pts;
+			last_pts = in->pts;
 			atomic_store_explicit(&s->output.write, ow + 1, memory_order_release);
 		}
 		atomic_store_explicit(&s->input.read, r + 1, memory_order_release);
@@ -129,12 +128,11 @@ int cdn_effects_submit(struct cdn_effects *s, const struct cdn_frame *in, uint64
 {
 	unsigned w = atomic_load_explicit(&s->input.write, memory_order_relaxed);
 	unsigned r = atomic_load_explicit(&s->input.read, memory_order_acquire);
-	uint64_t token = s->token++;
 	if (w-r == QUEUE) return 0;
 	struct slot *out = &s->input.slots[w % QUEUE];
 	struct cdn_frame packed = frame(s, out->data);
 	cdn_frame_copy(in, &packed);
-	out->pts = pts; out->seq = seq; out->token = token; out->enqueued = now_ns();
+	out->pts = pts; out->seq = seq; out->enqueued = now_ns();
 	atomic_store_explicit(&s->input.write, w+1, memory_order_release);
 	sem_post(&s->wake);
 	return 1;

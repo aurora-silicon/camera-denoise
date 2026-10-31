@@ -70,7 +70,8 @@ NV12 buffers. The PipeWire callback copies/submits and takes completed frames;
 it neither allocates model state nor waits for inference. A pending output
 buffer is returned to PipeWire's free pool. A slow worker drops overloaded
 inputs, discards output older than 200 ms and retains original frame timestamps.
-It never combines an old mask with a new image. Gaps reset framing state.
+It never combines an old mask with a new image. Ordinary dropped frames preserve time-based tracking; timestamp reversals or gaps
+over one second reset it.
 
 Effects run after the existing denoiser and are independent of its gain trigger.
 Disabling denoise does not disable a chosen effect. Model creation/inference
