@@ -74,8 +74,23 @@ int main(void)
 	atomic_store(&hold,0);
 	assert(take(a,&out,&pts,&seq));
 	assert(dst[0]==1 && dst[1]==77 && dst[48]==77);
+	/* Cross the dropped admission interval with an actually processed marker.
+	 * Without this, only the contiguous pre-drop burst would be observed. */
+	struct timespec pause={0,1000000};
+	int accepted=0,seen=0;
+	for (unsigned i=0;i<1000;i++) {
+		if (cdn_effects_submit(a,&in,2000200000,9000)) { accepted=1;break; }
+		cdn_effects_take(a,&out,&pts,&seq);
+		nanosleep(&pause,NULL);
+	}
+	assert(accepted);
+	for (unsigned i=0;i<1000;i++) {
+		if (cdn_effects_take(a,&out,&pts,&seq) && seq==9000) { seen=1;break; }
+		nanosleep(&pause,NULL);
+	}
+	assert(seen && pts==2000200000);
 	cdn_effects_free(a); cdn_effects_free(b);
-	assert(atomic_load(&resets)==before); /* Ordinary admission/output drops preserve crop history. */
+	assert(atomic_load(&resets)==before); /* Ordinary admission drops preserve crop history. */
 	assert(atomic_load(&calls)>=4);
 	return 0;
 }
