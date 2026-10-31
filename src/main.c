@@ -21,6 +21,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #include <pipewire/pipewire.h>
 #include <spa/param/video/format-utils.h>
