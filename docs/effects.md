@@ -52,7 +52,11 @@ The existing `boards.conf`, selected by device-tree compatible, owns framing
 capability and zoom bounds. J616s has `framing-supported = true`, zoom 1.0–6.0,
 and default 1.5 for its ultra-wide front sensor. J700/Neo has no framing block;
 framing requests are rejected there. Unknown boards also have no framing
-capability. Node properties `camera.framing.supported` and `camera.zoom.min`,
+capability unless the user opts in: `framing-supported = true` and the
+`framing-zoom-min`/`-max`/`-default` keys in the `[denoise]` section of
+`~/.config/aurora-camera-denoise/denoise.conf` (or `/etc/...`) enable it with
+the same validation as board data. On a camera without an ultra-wide sensor
+the zoom is a crop of a narrower image, so a maximum of about 2.0 is sensible. Node properties `camera.framing.supported` and `camera.zoom.min`,
 `camera.zoom.max`, `camera.zoom.default` expose this capability to UIs. No
 framing calibration was taken from private files. Denoise controls and board
 thresholds continue to use their established config.
