@@ -65,6 +65,13 @@ static void *work(void *opaque)
 		unsigned r = atomic_load_explicit(&s->input.read, memory_order_relaxed);
 		unsigned w = atomic_load_explicit(&s->input.write, memory_order_acquire);
 		if (r == w) continue;
+		/* Process the newest queued frame. A worker slower than the camera
+		 * otherwise works through a full FIFO and every result is older than
+		 * the freshness limit when it completes, so nothing is ever output. */
+		if (w - r > 1) {
+			r = w - 1;
+			atomic_store_explicit(&s->input.read, r, memory_order_release);
+		}
 		struct slot *in = &s->input.slots[r % QUEUE];
 		unsigned ow = atomic_load_explicit(&s->output.write, memory_order_relaxed);
 		unsigned or = atomic_load_explicit(&s->output.read, memory_order_acquire);
