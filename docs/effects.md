@@ -93,3 +93,23 @@ Target camera, portal/UI selection, real lighting, multi-client negotiation and
 ANE behavior remain lead-run qualification. See the companion backend's
 `LEAD-TEST-PLAN.md` for acceptance criteria and rollback. No packaged effects
 policy, model service preset or target deployment is included here.
+
+## Explicit digital-crop opt-in
+
+A named demo can use `--config /path/to/session.conf`. This replaces the system
+and default user settings for that process; packaged board data is still read.
+A missing explicit file is an error. CLI mode/backend still take precedence.
+
+To opt into digital face framing on another board, put this in that file:
+
+```ini
+[denoise]
+framing-supported = true
+framing-zoom-min = 1
+framing-zoom-max = 6
+framing-zoom-default = 1.5
+```
+
+This enables a software crop, without lens calibration or a wider field of view.
+It does not change packaged board data. Only processes selecting this file gain
+the capability; framing itself still requires the per-output Props control.

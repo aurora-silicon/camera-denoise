@@ -41,11 +41,11 @@ static int set_key(struct cdn_config *c, const char *k, const char *v, bool sett
 	double d = strtod(v, &end);
 	bool num = end != v && *trim(end) == 0;
 
-	if (!settings && !strcmp(k, "framing-supported") && (!strcmp(v,"true") || !strcmp(v,"false")))
+	if (!strcmp(k, "framing-supported") && (!strcmp(v,"true") || !strcmp(v,"false")))
 		c->framing.supported = !strcmp(v,"true");
-	else if (!settings && !strcmp(k,"framing-zoom-min") && num && isfinite(d)) c->framing.minimum = (float)d;
-	else if (!settings && !strcmp(k,"framing-zoom-max") && num && isfinite(d)) c->framing.maximum = (float)d;
-	else if (!settings && !strcmp(k,"framing-zoom-default") && num && isfinite(d)) c->framing.default_zoom = (float)d;
+	else if (!strcmp(k,"framing-zoom-min") && num && isfinite(d)) c->framing.minimum = (float)d;
+	else if (!strcmp(k,"framing-zoom-max") && num && isfinite(d)) c->framing.maximum = (float)d;
+	else if (!strcmp(k,"framing-zoom-default") && num && isfinite(d)) c->framing.default_zoom = (float)d;
 	else if (!strcmp(k, "enter-gain") && num) c->trig.enter_gain = (unsigned)d;
 	else if (!strcmp(k, "exit-gain") && num) c->trig.exit_gain = (unsigned)d;
 	else if (!strcmp(k, "enter-noise") && num) c->trig.enter_noise = (float)d;
