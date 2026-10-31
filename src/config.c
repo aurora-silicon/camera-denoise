@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 #include <ctype.h>
 #include <errno.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,6 +12,7 @@ static void defaults(struct cdn_config *c)
 {
 	memset(c, 0, sizeof(*c));
 	c->mode = CDN_MODE_AUTO;
+	c->framing.minimum = c->framing.maximum = c->framing.default_zoom = 1;
 	snprintf(c->backend, sizeof(c->backend), "auto");
 	snprintf(c->prefer, sizeof(c->prefer), "ane");
 	snprintf(c->drivers, sizeof(c->drivers), "apple-isp");
@@ -39,7 +41,12 @@ static int set_key(struct cdn_config *c, const char *k, const char *v, bool sett
 	double d = strtod(v, &end);
 	bool num = end != v && *trim(end) == 0;
 
-	if (!strcmp(k, "enter-gain") && num) c->trig.enter_gain = (unsigned)d;
+	if (!settings && !strcmp(k, "framing-supported") && (!strcmp(v,"true") || !strcmp(v,"false")))
+		c->framing.supported = !strcmp(v,"true");
+	else if (!settings && !strcmp(k,"framing-zoom-min") && num && isfinite(d)) c->framing.minimum = (float)d;
+	else if (!settings && !strcmp(k,"framing-zoom-max") && num && isfinite(d)) c->framing.maximum = (float)d;
+	else if (!settings && !strcmp(k,"framing-zoom-default") && num && isfinite(d)) c->framing.default_zoom = (float)d;
+	else if (!strcmp(k, "enter-gain") && num) c->trig.enter_gain = (unsigned)d;
 	else if (!strcmp(k, "exit-gain") && num) c->trig.exit_gain = (unsigned)d;
 	else if (!strcmp(k, "enter-noise") && num) c->trig.enter_noise = (float)d;
 	else if (!strcmp(k, "exit-noise") && num) c->trig.exit_noise = (float)d;
@@ -128,6 +135,11 @@ int cdn_config_load(struct cdn_config *c, const char *compat_path, const char *b
 	for (int i = 0; i < nsettings; i++)
 		if (settings[i] && parse(c, settings[i], NULL, NULL))
 			return -1;
+	if (!(1 <= c->framing.minimum && c->framing.minimum <= c->framing.default_zoom &&
+		  c->framing.default_zoom <= c->framing.maximum && c->framing.maximum <= 6)) {
+		fprintf(stderr, "camera-denoise: invalid board framing range\n");
+		return -1;
+	}
 	if (c->trig.exit_gain > c->trig.enter_gain)
 		c->trig.exit_gain = c->trig.enter_gain;
 	if (c->trig.exit_noise > c->trig.enter_noise)

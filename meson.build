@@ -24,7 +24,7 @@ add_project_arguments(
   language : 'c')
 
 core = static_library('cdn-core',
-  'src/backend.c', 'src/cpu/denoise_cpu.c', 'src/trigger.c', 'src/config.c', 'src/gain.c',
+  'src/backend.c', 'src/cpu/denoise_cpu.c', 'src/trigger.c', 'src/config.c', 'src/gain.c', 'src/effects.c',
   dependencies : [threads, dl, m])
 core_dep = declare_dependency(link_with : core, dependencies : [threads, dl, m])
 
@@ -59,3 +59,5 @@ test('cpu', executable('test_cpu', 'tests/test_cpu.c', dependencies : core_dep))
 test('trigger', executable('test_trigger', 'tests/test_trigger.c', dependencies : core_dep))
 test('config', executable('test_config', 'tests/test_config.c', dependencies : core_dep),
   args : [meson.current_build_dir()])
+
+test('effects', executable('test_effects', 'tests/test_effects.c', dependencies : core_dep))

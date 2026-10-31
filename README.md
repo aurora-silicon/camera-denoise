@@ -56,3 +56,8 @@ Needs `libpipewire-0.3` for the filter itself. The backend, tools and tests buil
 ## License
 
 MIT
+
+## Optional call effects
+
+Named stream outputs can opt into background blur/replacement and board-supported
+face framing. Both start off. See [per-stream controls and backend installation](docs/effects.md).

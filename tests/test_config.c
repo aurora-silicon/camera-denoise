@@ -35,6 +35,7 @@ int main(int argc, char **argv)
 	CHECK(cdn_config_load(&c, compat, boards, NULL, 0) == 0);
 	CHECK(!strcmp(c.board, "apple,j700"));
 	CHECK(c.trig.enter_gain == 2304 && c.trig.exit_gain == 1792);
+	CHECK(!c.framing.supported);
 	CHECK(c.mode == CDN_MODE_AUTO && !strcmp(c.backend, "auto"));
 
 	const char *s1[] = { "/nonexistent", user };
@@ -49,6 +50,13 @@ int main(int argc, char **argv)
 	CHECK(cdn_config_load(&c, "/nonexistent", boards, NULL, 0) == 0);
 	CHECK(c.board[0] == 0 && c.trig.enter_gain == 0);
 
+    f = fopen(boards, "a");
+    fputs("framing-supported = true\nframing-zoom-min = 1\nframing-zoom-max = 6\nframing-zoom-default = 1.5\n", f);
+    fclose(f);
+    CHECK(cdn_config_load(&c, compat, boards, NULL, 0) == 0);
+    CHECK(c.framing.supported && c.framing.minimum == 1 && c.framing.maximum == 6 && c.framing.default_zoom == 1.5f);
+    f = fopen(boards, "a"); fputs("framing-zoom-default = 7\n", f); fclose(f);
+    CHECK(cdn_config_load(&c, compat, boards, NULL, 0) != 0);
 	remove(compat); remove(boards); remove(user); remove(bad);
 	printf(fails ? "FAIL\n" : "PASS\n");
 	return fails != 0;
