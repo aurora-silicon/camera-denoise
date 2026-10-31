@@ -1,6 +1,7 @@
 #!/bin/sh
 # SPDX-License-Identifier: MIT
 set -eu
+export LC_ALL=C
 filter=$1
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
