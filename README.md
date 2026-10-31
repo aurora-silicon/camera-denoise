@@ -30,7 +30,7 @@ Copy `/usr/share/aurora-camera-denoise/examples/denoise.conf` to `~/.config/auro
 - `backend = auto | cpu`, where `auto` uses the Neural Engine backend when one is installed and works, else the CPU
 - any board level, e.g. `enter-gain = 1536`, or `enter-noise = 0` to follow the gain only
 
-To turn it off completely, `systemctl --user disable --now aurora-camera-denoise`.
+To turn it off completely, `systemctl --user mask --now aurora-camera-denoise`. The distro packages enable it for every user through a preset, so `disable` alone does not stick.
 
 ## How the CPU backend works
 
@@ -40,7 +40,7 @@ It is integer NEON code, one thread by default. At 1080p30 a frame takes about 3
 
 ## Backends
 
-The filter calls a small backend interface (`src/backend.h`). The CPU backend is built in, other backends are shared objects in `/usr/lib/aurora-camera-denoise/` loaded by name. `docs/ane-backend.md` describes how the Neural Engine backend plugs in.
+The filter calls a small backend interface (`src/backend.h`). The CPU backend is built in, other backends are shared objects in the package's library directory (`/usr/lib64/aurora-camera-denoise/` on Fedora, `/usr/lib/aurora-camera-denoise/` on Arch) loaded by name. `docs/ane-backend.md` describes how the Neural Engine backend plugs in.
 
 ## Tools
 

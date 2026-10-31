@@ -20,7 +20,7 @@ A backend returns a negative errno from `process` to have that frame passed thro
 
 ## Loading
 
-With `backend = auto` (the default) the filter tries each name in `prefer` (default `ane`) and loads `/usr/lib/aurora-camera-denoise/cdn-backend-<name>.so`, which must export
+With `backend = auto` (the default) the filter tries each name in `prefer` (default `ane`) and loads `cdn-backend-<name>.so` from the library directory the filter was built with (`<libdir>/aurora-camera-denoise/`, so `/usr/lib64/...` on Fedora and `/usr/lib/...` on Arch), which must export
 
     const struct cdn_backend_ops *cdn_backend_entry(void);
 
