@@ -21,6 +21,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #include <pipewire/pipewire.h>
 #include <spa/param/video/format-utils.h>
@@ -110,7 +111,7 @@ struct app {
 	struct spa_hook registry_listener;
 	struct spa_list cams;
 	struct cdn_config cfg;
-	const char *cli_mode, *cli_backend;
+	const char *cli_mode, *cli_backend, *cli_config;
 	const char *boards_path;
 	const char *stream_name;
 	bool verbose;
@@ -135,6 +136,15 @@ static int load_config(struct app *a)
 	else
 		user[0] = 0;
 	settings[1] = user[0] ? user : NULL;
+	/* An explicit session config isolates demos from the user's default service. */
+	if (a->cli_config) {
+		if (access(a->cli_config, R_OK) < 0) {
+			fprintf(stderr, "camera-denoise: config %s: %s\n", a->cli_config, strerror(errno));
+			return -1;
+		}
+		settings[0] = a->cli_config;
+		settings[1] = NULL;
+	}
 	if (cdn_config_load(&next, "/proc/device-tree/compatible", a->boards_path,
 			    settings, 2))
 		return -1;
@@ -940,7 +950,7 @@ static void usage(void)
 {
 	fprintf(stderr,
 		"usage: aurora-camera-denoise [--mode auto|on|off] [--backend auto|cpu|NAME]\n"
-		"                             [--boards FILE] [--stream NAME] [--verbose] [--print-config]\n");
+		"                             [--boards FILE] [--config FILE] [--stream NAME] [--verbose] [--print-config]\n");
 }
 
 int main(int argc, char **argv)
@@ -949,6 +959,7 @@ int main(int argc, char **argv)
 		{ "mode", required_argument, NULL, 'm' },
 		{ "backend", required_argument, NULL, 'b' },
 		{ "boards", required_argument, NULL, 'B' },
+		{ "config", required_argument, NULL, 'c' },
 		{ "stream", required_argument, NULL, 's' },
 		{ "verbose", no_argument, NULL, 'v' },
 		{ "print-config", no_argument, NULL, 'p' },
@@ -959,11 +970,12 @@ int main(int argc, char **argv)
 	bool print_only = false;
 	int o;
 
-	while ((o = getopt_long(argc, argv, "m:b:B:s:vph", opts, NULL)) != -1) {
+	while ((o = getopt_long(argc, argv, "m:b:B:c:s:vph", opts, NULL)) != -1) {
 		switch (o) {
 		case 'm': a.cli_mode = optarg; break;
 		case 'b': a.cli_backend = optarg; break;
 		case 'B': a.boards_path = optarg; break;
+		case 'c': a.cli_config = optarg; break;
 		case 's':
 			if (!*optarg || strlen(optarg) > 48 || strspn(optarg, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-") != strlen(optarg)) {
 				fprintf(stderr, "camera-effects: stream name needs 1-48 letters, digits, _ or -\n");

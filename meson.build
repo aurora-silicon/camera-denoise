@@ -30,8 +30,9 @@ core_dep = declare_dependency(link_with : core, dependencies : [threads, dl, m])
 
 pipewire = dependency('libpipewire-0.3', version : '>= 1.0', required : get_option('daemon'))
 if pipewire.found()
-  executable('aurora-camera-denoise', 'src/main.c',
+  daemon = executable('aurora-camera-denoise', 'src/main.c',
     dependencies : [core_dep, pipewire], install : true)
+  test('session-config', find_program('tests/check-session-config.sh'), args : [daemon])
 endif
 
 executable('aurora-camera-denoise-bench', 'tools/cdn-bench.c',

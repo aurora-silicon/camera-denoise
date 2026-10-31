@@ -43,6 +43,17 @@ int main(int argc, char **argv)
 	CHECK(c.mode == CDN_MODE_ON && !strcmp(c.backend, "cpu"));
 	CHECK(c.trig.enter_gain == 2304 && c.trig.exit_gain == 1500);
 
+	/* Digital framing is a user opt-in, not a packaged board capability. */
+	f = fopen(user, "a");
+	fputs("framing-supported = true\nframing-zoom-min = 1\nframing-zoom-max = 6\nframing-zoom-default = 1.5\n", f);
+	fclose(f);
+	CHECK(cdn_config_load(&c, compat, boards, s1, 2) == 0);
+	CHECK(c.framing.supported && c.framing.default_zoom == 1.5f);
+	CHECK(cdn_config_load(&c, compat, boards, NULL, 0) == 0);
+	CHECK(!c.framing.supported);
+	f = fopen(user, "a"); fputs("framing-zoom-default = 7\n", f); fclose(f);
+	CHECK(cdn_config_load(&c, compat, boards, s1, 2) != 0);
+
 	const char *s2[] = { bad };
 	CHECK(cdn_config_load(&c, compat, boards, s2, 1) != 0);
 
