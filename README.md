@@ -1,19 +1,21 @@
 # camera-denoise
 
-A PipeWire video filter that takes the grain out of the built-in camera on Apple silicon laptops in low light, the way macOS does with its automatic video noise reduction.
+A PipeWire video filter that takes the grain out of the built-in camera on Apple silicon laptops, the way macOS does: a temporal noise filter on every frame, and its automatic video noise reduction on top in low light.
 
 It runs as a user service. For each built-in camera (the `apple-isp` V4L2 driver) it adds a camera node with the same name and formats, which apps pick by default through the camera portal, PipeWire or GStreamer. The original stays available as "FaceTime HD Camera (V4L2)". Nothing touches the camera until an app streams from the filter.
 
 ## When it filters
 
-In `auto` mode it follows two signals, each with its own on and off level so it does not flicker:
+The temporal filter runs on every frame of every stream, as macOS runs its motion-compensated temporal filter on every camera stream. It's what makes the macOS camera look clean in a normal room. Measured on the MacBook Pro 16-inch M4 Pro, same scene, on a flat part of the picture: luma noise 13.6 straight from the camera, 2.4 through this filter and 2.1 on macOS (8-bit code values).
+
+A low-light stage joins in on top when a backend plugin such as the Neural Engine one is installed, like macOS' machine-learning noise reduction. In `auto` mode it follows two signals, each with its own on and off level so it does not flicker:
 
 - the total sensor gain the camera driver reports for every frame (`V4L2_CID_GAIN`, read-only, 1/256 steps), with the same levels macOS uses on each machine
 - the noise it measures from frame to frame, for noise the gain does not explain (a camera running without its sensor tuning, for example)
 
-It also requires a frame rate of 30 fps or less, and fades out over 30 frames instead of switching off. Below the levels frames are copied through unchanged.
+It also requires a frame rate of 30 fps or less, and fades out over 30 frames instead of switching off. Below the levels the low-light stage is off and only the temporal filter runs.
 
-The levels are board data in `/usr/share/aurora-camera-denoise/boards.conf`, keyed by the device-tree compatible. Boards without data are left alone unless you set `mode = on`.
+The levels are board data in `/usr/share/aurora-camera-denoise/boards.conf`, keyed by the device-tree compatible. Boards without data get the temporal filter only, unless you set `mode = on`.
 
 | Board | On at gain | Off below | Noise on / off |
 | --- | --- | --- | --- |
@@ -26,7 +28,8 @@ Kernels without the gain report fall back to the noise signal alone.
 
 Copy `/usr/share/aurora-camera-denoise/examples/denoise.conf` to `~/.config/aurora-camera-denoise/denoise.conf` (or `/etc/aurora-camera-denoise/denoise.conf` for everyone) and change what you like, then `systemctl --user reload aurora-camera-denoise`.
 
-- `mode = auto | on | off`
+- `mode = auto | on | off`, where `off` passes every frame through unchanged
+- `temporal = on | off`. With `off` the filter works as it did before: nothing runs below the levels, and above them the one backend (Neural Engine or CPU) does all the work
 - `backend = auto | cpu`, where `auto` uses the Neural Engine backend when one is installed and works, else the CPU
 - any board level, e.g. `enter-gain = 1536`, or `enter-noise = 0` to follow the gain only
 

@@ -11,6 +11,7 @@ static void defaults(struct cdn_config *c)
 {
 	memset(c, 0, sizeof(*c));
 	c->mode = CDN_MODE_AUTO;
+	c->temporal = true;
 	snprintf(c->backend, sizeof(c->backend), "auto");
 	snprintf(c->prefer, sizeof(c->prefer), "ane");
 	snprintf(c->drivers, sizeof(c->drivers), "apple-isp");
@@ -47,6 +48,11 @@ static int set_key(struct cdn_config *c, const char *k, const char *v, bool sett
 	else if (!strcmp(k, "ramp-up-frames") && num) c->trig.ramp_up_frames = (int)d;
 	else if (!strcmp(k, "ramp-down-frames") && num) c->trig.ramp_down_frames = (int)d;
 	else if (settings && !strcmp(k, "mode")) return cdn_mode_parse(v, &c->mode);
+	else if (settings && !strcmp(k, "temporal")) {
+		if (!strcmp(v, "on")) c->temporal = true;
+		else if (!strcmp(v, "off")) c->temporal = false;
+		else return -1;
+	}
 	else if (settings && !strcmp(k, "backend")) snprintf(c->backend, sizeof(c->backend), "%s", v);
 	else if (settings && !strcmp(k, "prefer")) snprintf(c->prefer, sizeof(c->prefer), "%s", v);
 	else if (settings && !strcmp(k, "threads") && num) c->threads = (int)d;
@@ -138,9 +144,10 @@ int cdn_config_load(struct cdn_config *c, const char *compat_path, const char *b
 void cdn_config_print(const struct cdn_config *c)
 {
 	fprintf(stderr,
-		"camera-denoise: board %s, mode %s, backend %s (prefer %s), "
+		"camera-denoise: board %s, mode %s, temporal %s, backend %s (prefer %s), "
 		"enter gain >= %u, exit < %u, noise %.2f/%.2f, fps <= %.0f, ramp %d/%d frames\n",
-		*c->board ? c->board : "(no board data)", cdn_mode_name(c->mode), c->backend,
+		*c->board ? c->board : "(no board data)", cdn_mode_name(c->mode),
+		c->temporal ? "on" : "off", c->backend,
 		c->prefer, c->trig.enter_gain, c->trig.exit_gain, c->trig.enter_noise,
 		c->trig.exit_noise, c->trig.fps_threshold, c->trig.ramp_up_frames,
 		c->trig.ramp_down_frames);
