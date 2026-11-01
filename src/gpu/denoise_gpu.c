@@ -24,7 +24,7 @@ struct imported { struct buffer b; dev_t dev; ino_t ino; };
 struct push { int32_t w, h, sy, sc, oy, oc, strength, seed; };
 struct gpu {
 	int w, h;
-	bool valid, dead, dma;
+	bool valid, dead, dma, can_dma;
 	float sigma;
 	bool said_upload, said_import;
 	VkInstance instance;
@@ -223,6 +223,7 @@ static int init(struct gpu *s)
 	vkGetPhysicalDeviceMemoryProperties(s->physical, &s->memory);
 	if (s->dma) s->fd_properties = (PFN_vkGetMemoryFdPropertiesKHR)vkGetDeviceProcAddr(s->device, "vkGetMemoryFdPropertiesKHR");
 	if (!s->fd_properties) s->dma = false;
+	s->can_dma = s->dma;
 	VkPhysicalDeviceProperties prop;
 	vkGetPhysicalDeviceProperties(s->physical, &prop);
 	s->max_range = prop.limits.maxStorageBufferRange;
@@ -489,7 +490,16 @@ static int gpu_dmabuf(void *p, const struct cdn_dmabuf *in, struct cdn_frame *ou
 	return rc;
 }
 
-static void gpu_reset(void *p) { ((struct gpu *)p)->valid = false; }
+static void gpu_reset(void *p)
+{
+	struct gpu *s = p;
+	s->valid = false;
+	// Calls are synchronous. Release references to the old camera pool on
+	// stream stop/pass-through, and allow the next pool to probe import again.
+	for (unsigned i = 0; i < CACHE; i++) free_buffer(s, &s->imported[i].b);
+	s->next_import = 0;
+	s->dma = s->can_dma;
+}
 static float gpu_sigma(void *p) { return ((struct gpu *)p)->sigma; }
 static const struct cdn_backend_ops ops = {
 	.abi = CDN_BACKEND_ABI, .name = "gpu", .create = gpu_create,

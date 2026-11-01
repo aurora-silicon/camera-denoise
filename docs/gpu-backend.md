@@ -5,7 +5,8 @@ It needs no display server or window surface. Honeykrisp/Borealis use the
 same shaders on G13/G14/G16/G17; actual driver/device validation is recorded
 separately below. A working hardware device is preferred automatically for
 the always-on temporal stage. Missing plugin/device or a processing error
-falls back to CPU. `--backend cpu` forces the CPU baseline, including the
+falls back to CPU. Processing failure recreates CPU history, so its first
+frame passes through and temporal averaging warms up again. `--backend cpu` forces the CPU baseline, including the
 temporal stage. The gain-triggered low-light plugin remains independent.
 
 Build with Vulkan development headers/loader and `glslangValidator`:
@@ -55,7 +56,8 @@ NV12 and separate plane fds are supported. Nonlinear modifiers are rejected
 at format negotiation. Import uses `VK_EXT_external_memory_dma_buf`,
 `VK_KHR_external_memory_fd` and `VK_EXT_queue_family_foreign`, queries memory
 compatibility, duplicates fds before transferring ownership to Vulkan, and
-caches up to 16 imports by fd device/inode. The camera retains its own fds.
+caches up to 16 imports by fd device/inode. Reset releases those references
+when a stream stops or passes through. The camera retains its own fds.
 
 Before the mapped-input noise trigger and GPU access, polling the DMA-BUF waits for its implicit writer fence.
 Foreign queue ownership is acquired and released with buffer barriers. The
@@ -70,7 +72,7 @@ interfaces.
 
 If importing a particular allocation is unsupported, `-ENOTSUP` retries the
 normal path without changing temporal history. Unsupported pool imports
-use uploads until the backend is recreated, avoiding repeated failed imports. Ordinary mapped NV12 gets
+use uploads until reset/backend recreation, avoiding repeated failed imports. Ordinary mapped NV12 gets
 one row-wise copy directly into a persistent mapped Vulkan upload buffer.
 No intermediate CPU denoising or noise histogram is performed. Both paths
 read the completed output back into the existing PipeWire memory output;
