@@ -45,6 +45,8 @@ struct ave {
 	bool mplane;
 	uint32_t out_type, cap_type;
 	uint32_t out_bpl, cap_bpl, out_size, cap_size;
+	/* chroma plane offset: the driver may pad the luma height (1080 -> 1088) */
+	size_t out_uv, cap_uv;
 	struct qbuf out[NBUF], cap[NBUF];
 	uint32_t level_id;	/* 0 when the driver has no level control */
 	int level;		/* last level set */
@@ -277,6 +279,14 @@ static void *ave_create(int width, int height, int threads)
 	    set_fmt(a, a->cap_type, &a->cap_bpl, &a->cap_size) ||
 	    map_bufs(a, a->out_type, a->out) || map_bufs(a, a->cap_type, a->cap))
 		goto fail;
+	/*
+	 * One NV12 plane: luma rows (possibly padded), then chroma at half
+	 * the luma height, so chroma starts at two thirds of the image.
+	 */
+	a->out_uv = (size_t)a->out_size / 3 * 2 / a->out_bpl * a->out_bpl;
+	a->cap_uv = (size_t)a->cap_size / 3 * 2 / a->cap_bpl * a->cap_bpl;
+	if (a->out_uv < (size_t)a->out_bpl * a->h || a->cap_uv < (size_t)a->cap_bpl * a->h)
+		goto fail;
 	a->level_id = find_ctrl(a->fd, LEVEL_CTRL);
 	return a;
 fail:
@@ -284,17 +294,17 @@ fail:
 	return NULL;
 }
 
-static void copy_in(uint8_t *dst, uint32_t bpl, int h, const struct cdn_frame *in)
+static void copy_in(uint8_t *dst, uint32_t bpl, size_t uv, int h, const struct cdn_frame *in)
 {
 	for (int y = 0; y < h; y++)
 		memcpy(dst + (size_t)y * bpl, in->y + (size_t)y * in->stride_y, (size_t)in->width);
-	dst += (size_t)bpl * h;
+	dst += uv;
 	for (int y = 0; y < h / 2; y++)
 		memcpy(dst + (size_t)y * bpl, in->uv + (size_t)y * in->stride_uv, (size_t)in->width);
 }
 
 /* out = in + s * (f - in), row by row; s == 1 is a plain copy */
-static void copy_out(struct cdn_frame *out, const uint8_t *src, uint32_t bpl,
+static void copy_out(struct cdn_frame *out, const uint8_t *src, uint32_t bpl, size_t uv,
 		     const struct cdn_frame *in, float s)
 {
 	int w = out->width, h = out->height;
@@ -302,7 +312,7 @@ static void copy_out(struct cdn_frame *out, const uint8_t *src, uint32_t bpl,
 
 	for (int p = 0; p < 2; p++) {
 		int rows = p ? h / 2 : h;
-		const uint8_t *f = src + (p ? (size_t)bpl * h : 0);
+		const uint8_t *f = src + (p ? uv : 0);
 		uint8_t *o = p ? out->uv : out->y;
 		const uint8_t *i0 = p ? in->uv : in->y;
 		int so = p ? out->stride_uv : out->stride_y, si = p ? in->stride_uv : in->stride_y;
@@ -359,7 +369,7 @@ static int ave_process(void *state, const struct cdn_frame *in, struct cdn_frame
 	set_level(a, cdn_mctf_level_step(&a->lv, info ? info->gain : 0));
 
 	oi = a->next_out;
-	copy_in(a->out[oi].p, a->out_bpl, a->h, in);
+	copy_in(a->out[oi].p, a->out_bpl, a->out_uv, a->h, in);
 	fill_buf(a, &b, &pl, a->out_type, oi);
 	if (a->mplane)
 		pl.bytesused = a->out_size;
@@ -375,7 +385,7 @@ static int ave_process(void *state, const struct cdn_frame *in, struct cdn_frame
 
 	r = wait_dq(a, a->cap_type, &ci);
 	if (r == 0)
-		copy_out(out, a->cap[ci].p, a->cap_bpl, in, strength);
+		copy_out(out, a->cap[ci].p, a->cap_bpl, a->cap_uv, in, strength);
 	if (r == 0 || r == -EIO)
 		qcap(a, ci);
 	/* get the output buffer back so the ring never runs dry */
