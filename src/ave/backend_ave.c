@@ -10,7 +10,8 @@
  * moving objects are averaged along their motion instead of leaving trails
  * or falling back to raw noise. Stopping the queues drops the history.
  *
- * The level control follows what macOS asks for (see mctf_level.h).
+ * Like macOS's camera daemon, the session starts at strength 16 and the
+ * per-frame level then follows the light (see mctf_level.h).
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -32,6 +33,9 @@
 #define NBUF 4
 #define CARD "Apple AVE MCTF"
 #define LEVEL_CTRL "MCTF Level"
+#define STRENGTH_CTRL "MCTF Strength"
+/* the session strength macOS's camera daemon starts with (Start +0x26f8) */
+#define SESSION_STRENGTH 16
 #define TIMEOUT_MS 200
 
 struct qbuf {
@@ -49,6 +53,7 @@ struct ave {
 	size_t out_uv, cap_uv;
 	struct qbuf out[NBUF], cap[NBUF];
 	uint32_t level_id;	/* 0 when the driver has no level control */
+	uint32_t strength_id;	/* 0 when the driver has no session strength control */
 	int level;		/* last level set */
 	struct cdn_mctf_level lv;
 	bool streaming;
@@ -226,6 +231,12 @@ static void stream(struct ave *a, bool on)
 
 	if (on == a->streaming)
 		return;
+	if (on && a->strength_id) {
+		/* the driver applies it when the session starts */
+		struct v4l2_control c = { .id = a->strength_id, .value = SESSION_STRENGTH };
+
+		xioctl(a->fd, VIDIOC_S_CTRL, &c);
+	}
 	t = a->out_type;
 	xioctl(a->fd, on ? VIDIOC_STREAMON : VIDIOC_STREAMOFF, &t);
 	t = a->cap_type;
@@ -288,6 +299,7 @@ static void *ave_create(int width, int height, int threads)
 	if (a->out_uv < (size_t)a->out_bpl * a->h || a->cap_uv < (size_t)a->cap_bpl * a->h)
 		goto fail;
 	a->level_id = find_ctrl(a->fd, LEVEL_CTRL);
+	a->strength_id = find_ctrl(a->fd, STRENGTH_CTRL);
 	return a;
 fail:
 	ave_destroy(a);
