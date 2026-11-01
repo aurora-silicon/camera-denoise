@@ -49,6 +49,7 @@ The filter calls a small backend interface (`src/backend.h`). The CPU backend is
 
 - `aurora-camera-denoise-bench W H frames.nv12` runs a backend over raw NV12 frames and reports latency and CPU time
 - `aurora-camera-denoise-metrics W H reference.nv12 test.nv12` reports temporal noise, PSNR and SSIM against the average of a long static capture
+- `cdn-motion` (built, not installed) moves a synthetic object over a noisy scene and measures the trail it leaves behind, the static noise and the CPU time, for tuning the CPU backend's motion tests
 
 ## Building
 

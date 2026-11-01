@@ -3,10 +3,12 @@
  * CPU denoiser for NV12 camera frames.
  *
  * 1. Temporal: a motion-adaptive recursive filter. Each luma pixel keeps a
- *    12-bit history (8.4 fixed point). The 3x3 sum of |frame - history|
- *    measures motion against the estimated noise; static pixels blend in
- *    1/8 of the new frame (about 15 frames of averaging), moving pixels
- *    take the new frame as is, so motion does not smear.
+ *    12-bit history (8.4 fixed point). Three tests of frame - history
+ *    against the estimated noise measure motion: the 3x3 sum of its
+ *    magnitude, and the 5x5 and 9x9 sums of its sign, which see faint
+ *    changes over larger areas. Static pixels blend in 1/8 of the new
+ *    frame (about 15 frames of averaging), moving pixels take the new
+ *    frame as is, so motion does not smear.
  * 2. Spatial: an edge-clipped 3x3 mean on luma, whose clip level follows
  *    the temporal weight: where motion stopped the temporal filter, the
  *    spatial filter does the work; on static areas it hardly acts.
@@ -74,7 +76,7 @@ struct cdn_cpu {
 	 * weight (Q15), temporal outputs */
 	uint8_t *dy;
 	int8_t *ds;
-	int16_t *hs;
+	int16_t *hs, *hs9;
 	uint16_t *ky;
 	uint8_t *ty, *tuv, *tuv2;
 	/* frames averaged into each luma pixel's history since motion reset it */
@@ -82,12 +84,14 @@ struct cdn_cpu {
 
 	/* per-frame parameters */
 	int sig_y16, sig_c16;   /* median |frame - history|, x16 */
+	int sig9_16;            /* median |9x9 sum of frame - history|, x16 */
 	float sigma_y;          /* reported */
 	int kmin;               /* Q15 */
 	/* weight = kmin + (min(m - lo, range) * scale) >> shift */
 	uint16_t lo, range, scale;		/* 3x3 sum of |d| */
 	uint16_t alo, arange, ascale;		/* |5x5 sum of d| */
-	int shift, ashift;
+	uint16_t blo, brange, bscale;		/* |9x9 sum of d| */
+	int shift, ashift, bshift;
 	int16_t ts_y, ts_c;     /* spatial clip levels */
 	int strength8;          /* 0..256 */
 
@@ -192,6 +196,58 @@ static int temporal_scale16(const uint8_t *src, int stride, const int16_t *hist,
 	return meds[nm / 2];
 }
 
+static inline int8_t sat_s8(int v)
+{
+	return (int8_t)(v < -128 ? -128 : v > 127 ? 127 : v);
+}
+
+/*
+ * Scale of the wide motion statistic: median of |9x9 sum of (frame -
+ * history)|, x16, over a sparse grid, by block as above. Its relation to the
+ * per-pixel scale depends on how far the sensor noise is correlated, which
+ * differs between cameras and gains, so it is measured rather than derived.
+ */
+static int wide_scale16(const uint8_t *src, int stride, const int16_t *hist, int w, int h)
+{
+	int meds[NB_X * NB_Y], nm = 0;
+	int bw = w / NB_X, bh = h / NB_Y;
+	/* about 5x5 samples per block (120x120 at 1080p, 20x20 at 320x180) */
+	int step = ((bw < bh ? bw : bh) - 8) / 5;
+
+	if (step < 1)
+		return 0;
+	for (int by = 0; by < NB_Y; by++)
+		for (int bx = 0; bx < NB_X; bx++) {
+			int v[64], n = 0;
+			uint32_t sum = 0, cnt = 0;
+
+			for (int y = by * bh + 4; y < (by + 1) * bh - 4 && n < 64; y += step)
+				for (int x = bx * bw + 4; x < (bx + 1) * bw - 4 && n < 64; x += step) {
+					int acc = 0;
+					for (int dy = -4; dy <= 4; dy++) {
+						const uint8_t *sr = src + (size_t)(y + dy) * stride;
+						const int16_t *hr = hist + (size_t)(y + dy) * w;
+						for (int dx = -4; dx <= 4; dx++)
+							acc += sat_s8((int)sr[x + dx] - sat_u8((hr[x + dx] + 8) >> 4));
+					}
+					v[n++] = abs(acc);
+					sum += src[(size_t)y * stride + x];
+					cnt++;
+				}
+			if (n < 8)
+				continue;
+			uint32_t mean = sum / cnt;
+			if (mean < 20 || mean > 245)
+				continue;
+			qsort(v, (size_t)n, sizeof(int), cmp_int);
+			meds[nm++] = (n & 1 ? v[n / 2] * 16 : (v[n / 2 - 1] + v[n / 2]) * 8);
+		}
+	if (nm < 4)
+		return 0;
+	qsort(meds, (size_t)nm, sizeof(int), cmp_int);
+	return meds[nm / 2];
+}
+
 /* the largest shift (<= 16) whose scale still fits 16 bits */
 static uint16_t weight_scale(int kmin, int range, int *shift)
 {
@@ -235,6 +291,28 @@ static void set_params(struct cdn_cpu *s)
 	s->alo = (uint16_t)alo;
 	s->arange = (uint16_t)(ahi - alo);
 	s->ascale = weight_scale(s->kmin, s->arange, &s->ashift);
+	/*
+	 * |9x9 sum of d|: averages about three times as many samples as the
+	 * 5x5 sum, so it sees a change of a few levels over an area. That is
+	 * what a low-contrast object leaves behind: a faint copy of itself in
+	 * the history, which the 3x3 and 5x5 tests miss and which then fades
+	 * at 1/8 a frame, a trail. Its thresholds are multiples of its own
+	 * measured scale (see wide_scale16), not of the per-pixel one, since
+	 * how the two relate depends on how far the noise is correlated.
+	 * Static noise crosses the low end now and then; that only restarts
+	 * the pixel's running mean, and tools/cdn-motion.c measures the cost
+	 * (static std up about 5%, trails down 2 to 3 times).
+	 *   |9x9 sum d|:   full averaging below 3 of its medians (2 std),
+	 *                  none from 6 (4 std)
+	 */
+	/* 9 medians is the value for uncorrelated noise, the least it can be */
+	int med9 = s->sig9_16 < med * 9 ? med * 9 : s->sig9_16;
+	int blo = (med9 * 48) >> 8, bhi = (med9 * 96) >> 8;
+	if (bhi <= blo)
+		bhi = blo + 1;
+	s->blo = (uint16_t)blo;
+	s->brange = (uint16_t)(bhi - blo);
+	s->bscale = weight_scale(s->kmin, s->brange, &s->bshift);
 	/* spatial clip: about 2 sigma on luma, 3 on chroma (sigma = 1.75 med) */
 	s->ts_y = clamp16((med * 7 + 16) >> 5, 1, 64);
 	s->ts_c = clamp16((medc * 21 + 32) >> 6, 1, 64);
@@ -242,11 +320,6 @@ static void set_params(struct cdn_cpu *s)
 
 /* ---------------------------------------------------------------------- */
 /* pass 1: |Y - history|                                                   */
-
-static inline int8_t sat_s8(int v)
-{
-	return (int8_t)(v < -128 ? -128 : v > 127 ? 127 : v);
-}
 
 static void pass_diff(struct cdn_cpu *s, int y0, int y1)
 {
@@ -259,6 +332,7 @@ static void pass_diff(struct cdn_cpu *s, int y0, int y1)
 		uint8_t *d = s->dy + (size_t)y * w;
 		int8_t *ds = s->ds + (size_t)y * w;
 		int16_t *hs = s->hs + (size_t)y * w;
+		int16_t *h9 = s->hs9 + (size_t)y * w;
 		int x = 0;
 #if CDN_NEON
 		if (s->use_neon)
@@ -307,6 +381,30 @@ static void pass_diff(struct cdn_cpu *s, int y0, int y1)
 		for (; x < w; x++)
 			HS_SCALAR(x);
 #undef HS_SCALAR
+
+		/* horizontal 9-sums: two 5-sums overlapping at x */
+#define H9_SCALAR(X)                                                               \
+	do {                                                                       \
+		int acc = 0;                                                       \
+		for (int dx = -4; dx <= 4; dx++) {                                 \
+			int xx = (X) + dx;                                         \
+			xx = xx < 0 ? 0 : xx > w - 1 ? w - 1 : xx;                 \
+			acc += ds[xx];                                             \
+		}                                                                  \
+		h9[X] = (int16_t)acc;                                              \
+	} while (0)
+		for (x = 0; x < 4; x++)
+			H9_SCALAR(x);
+#if CDN_NEON
+		if (s->use_neon)
+			for (; x + 8 <= w - 4; x += 8) {
+				int16x8_t a = vaddq_s16(vld1q_s16(hs + x - 2), vld1q_s16(hs + x + 2));
+				vst1q_s16(h9 + x, vsubq_s16(a, vmovl_s8(vld1_s8(ds + x))));
+			}
+#endif
+		for (; x < w; x++)
+			H9_SCALAR(x);
+#undef H9_SCALAR
 	}
 }
 
@@ -323,11 +421,13 @@ static inline uint16_t ramp(int m, int lo, int range, int scale, int shift)
 	return (uint16_t)(((uint32_t)d * (uint32_t)scale) >> shift);
 }
 
-static inline uint16_t weight_scalar(const struct cdn_cpu *s, int m, int a)
+static inline uint16_t weight_scalar(const struct cdn_cpu *s, int m, int a, int b)
 {
 	uint16_t wb = ramp(m, s->lo, s->range, s->scale, s->shift);
 	uint16_t wa = ramp(a < 0 ? -a : a, s->alo, s->arange, s->ascale, s->ashift);
-	return (uint16_t)(s->kmin + (wa > wb ? wa : wb));
+	uint16_t w9 = ramp(b < 0 ? -b : b, s->blo, s->brange, s->bscale, s->bshift);
+	uint16_t wm = wa > wb ? wa : wb;
+	return (uint16_t)(s->kmin + (w9 > wm ? w9 : wm));
 }
 
 static void pass_temporal_y(struct cdn_cpu *s, int y0, int y1)
@@ -340,11 +440,16 @@ static void pass_temporal_y(struct cdn_cpu *s, int y0, int y1)
 		int ya = y > 0 ? y - 1 : 0, yb = y < h - 1 ? y + 1 : h - 1;
 		const uint8_t *da = s->dy + (size_t)ya * w, *db = s->dy + (size_t)y * w,
 			      *dc = s->dy + (size_t)yb * w;
-		const int16_t *hr[5];
+		const int16_t *hr[5], *h9[9];
 		for (int j = 0; j < 5; j++) {
 			int yy = y + j - 2;
 			yy = yy < 0 ? 0 : yy > h - 1 ? h - 1 : yy;
 			hr[j] = s->hs + (size_t)yy * w;
+		}
+		for (int j = 0; j < 9; j++) {
+			int yy = y + j - 4;
+			yy = yy < 0 ? 0 : yy > h - 1 ? h - 1 : yy;
+			h9[j] = s->hs9 + (size_t)yy * w;
 		}
 		int16_t *hist = s->hy + (size_t)y * w;
 		uint16_t *k = s->ky + (size_t)y * w;
@@ -359,7 +464,10 @@ static void pass_temporal_y(struct cdn_cpu *s, int y0, int y1)
 		int m = da[xl] + da[X] + da[xr] + db[xl] + db[X] + db[xr] +      \
 			dc[xl] + dc[X] + dc[xr];                                  \
 		int av = hr[0][X] + hr[1][X] + hr[2][X] + hr[3][X] + hr[4][X];   \
-		uint16_t km = weight_scalar(s, m, av);                            \
+		int bv = 0;                                                       \
+		for (int j = 0; j < 9; j++)                                       \
+			bv += h9[j][X];                                           \
+		uint16_t km = weight_scalar(s, m, av, bv);                        \
 		uint16_t ka = age_weight[age[X]];                                 \
 		uint16_t kk = km > ka ? km : ka;                                  \
 		age[X] = km > KMAX / 2 ? 1 : age[X] + 1 > AGE_MAX ? AGE_MAX : age[X] + 1; \
@@ -380,6 +488,9 @@ static void pass_temporal_y(struct cdn_cpu *s, int y0, int y1)
 			uint16x4_t ascale = vdup_n_u16(s->ascale);
 			uint16x8_t kmin = vdupq_n_u16((uint16_t)s->kmin);
 			int32x4_t nsh = vdupq_n_s32(-s->shift), nash = vdupq_n_s32(-s->ashift);
+			uint16x8_t blo = vdupq_n_u16(s->blo), brange = vdupq_n_u16(s->brange);
+			uint16x4_t bscale = vdup_n_u16(s->bscale);
+			int32x4_t nbsh = vdupq_n_s32(-s->bshift);
 			uint8_t tlo[16], thi[16];
 			for (int i = 0; i < 16; i++) {
 				tlo[i] = (uint8_t)age_weight[i];
@@ -410,7 +521,16 @@ static void pass_temporal_y(struct cdn_cpu *s, int y0, int y1)
 				uint32x4_t q1 = vmull_u16(vget_high_u16(e), ascale);
 				uint16x8_t wa = vcombine_u16(vmovn_u32(vshlq_u32(q0, nash)),
 							     vmovn_u32(vshlq_u32(q1, nash)));
-				uint16x8_t km = vaddq_u16(kmin, vmaxq_u16(wa, wb));
+				int16x8_t bv = vld1q_s16(h9[0] + x);
+				for (int j = 1; j < 9; j++)
+					bv = vaddq_s16(bv, vld1q_s16(h9[j] + x));
+				uint16x8_t ba = vreinterpretq_u16_s16(vabsq_s16(bv));
+				uint16x8_t f = vminq_u16(vqsubq_u16(ba, blo), brange);
+				uint32x4_t r0 = vmull_u16(vget_low_u16(f), bscale);
+				uint32x4_t r1 = vmull_u16(vget_high_u16(f), bscale);
+				uint16x8_t w9 = vcombine_u16(vmovn_u32(vshlq_u32(r0, nbsh)),
+							     vmovn_u32(vshlq_u32(r1, nbsh)));
+				uint16x8_t km = vaddq_u16(kmin, vmaxq_u16(w9, vmaxq_u16(wa, wb)));
 				uint8x8_t ag = vld1_u8(age + x);
 				uint16x8_t ka = vorrq_u16(vmovl_u8(vqtbl1_u8(rlo, ag)),
 							  vshlq_n_u16(vmovl_u8(vqtbl1_u8(rhi, ag)), 8));
@@ -710,18 +830,20 @@ static void *cpu_create(int width, int height, int threads)
 	s->dy = malloc(n);
 	s->ds = malloc(n);
 	s->hs = malloc(n * 2);
+	s->hs9 = malloc(n * 2);
 	s->ky = malloc(n * 2);
 	s->age = malloc(n);
 	s->ty = malloc(n);
 	s->tuv = malloc(n / 2);
 	s->tuv2 = malloc(n / 2);
-	if (!s->hy || !s->huv || !s->dy || !s->ds || !s->hs || !s->ky || !s->age || !s->ty || !s->tuv || !s->tuv2) {
+	if (!s->hy || !s->huv || !s->dy || !s->ds || !s->hs || !s->hs9 || !s->ky || !s->age || !s->ty || !s->tuv || !s->tuv2) {
 		cdn_cpu_destroy(s);
 		return NULL;
 	}
 	s->use_neon = CDN_NEON;
 	s->sig_y16 = 2 * 16;
 	s->sig_c16 = 1 * 16;
+	s->sig9_16 = 0;
 	s->strength8 = 256;
 
 	/*
@@ -778,6 +900,7 @@ void cdn_cpu_destroy(void *p)
 	free(s->dy);
 	free(s->ds);
 	free(s->hs);
+	free(s->hs9);
 	free(s->ky);
 	free(s->age);
 	free(s->ty);
@@ -807,10 +930,12 @@ static void update_noise(struct cdn_cpu *s, const struct cdn_frame *in)
 {
 	int my = temporal_scale16(in->y, in->stride_y, s->hy, s->w, s->w, s->h, 2);
 	int mc = temporal_scale16(in->uv, in->stride_uv, s->huv, s->w, s->w, s->h / 2, 3);
+	int m9 = wide_scale16(in->y, in->stride_y, s->hy, s->w, s->h);
 
 	/* smooth: the estimate is noisy frame to frame */
 	s->sig_y16 += (my - s->sig_y16) / 4;
 	s->sig_c16 += (mc - s->sig_c16) / 4;
+	s->sig9_16 += (m9 - s->sig9_16) / 4;
 	s->sigma_y = s->sig_y16 * 1.75f / 16.0f;
 }
 

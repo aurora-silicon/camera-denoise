@@ -38,6 +38,8 @@ executable('aurora-camera-denoise-bench', 'tools/cdn-bench.c',
   dependencies : core_dep, install : true)
 executable('aurora-camera-denoise-metrics', 'tools/cdn-metrics.c',
   dependencies : m, install : true)
+# motion trail benchmark (synthetic, needs no capture): not installed
+executable('cdn-motion', 'tools/cdn-motion.c', dependencies : core_dep)
 
 install_data('data/boards.conf', install_dir : pkgdatadir)
 install_data('data/denoise.conf', install_dir : pkgdatadir / 'examples')
