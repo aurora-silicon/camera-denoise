@@ -9,6 +9,12 @@
 struct cdn_config {
 	struct cdn_trigger_cfg trig;
 	enum cdn_mode mode;
+	/*
+	 * Run the temporal filter on every frame, as macOS runs its
+	 * motion-compensated temporal filter on every camera stream. The
+	 * trigger then only decides when the low-light stage joins in.
+	 */
+	bool temporal;
 	char backend[32];	/* auto, cpu or a plugin name */
 	char prefer[64];	/* plugins "auto" tries before cpu */
 	int threads;		/* 0: backend default */

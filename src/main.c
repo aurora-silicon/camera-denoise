@@ -5,12 +5,17 @@
  * For every PipeWire camera source whose V4L2 driver is listed in the
  * config (apple-isp by default), publish a Video/Source node with the same
  * formats (NV12). When a client streams from it, connect to the camera,
- * denoise each frame (when the trigger says so) and pass it on. With no
- * client, the camera is not touched.
+ * denoise each frame and pass it on. With no client, the camera is not
+ * touched.
  *
- * The trigger follows the sensor gain the driver reports per frame, with
- * per-board enter/exit thresholds and a ramp, like macOS' automatic ML
- * video noise reduction. Below the threshold frames are copied unchanged.
+ * Like macOS, two stages. The temporal filter runs on every frame, as
+ * macOS runs its motion-compensated temporal filter on every camera
+ * stream. A low-light stage (a backend plugin such as the Neural Engine
+ * one) joins in when the trigger says so: it follows the sensor gain the
+ * driver reports per frame, with per-board enter/exit thresholds and a
+ * ramp, like macOS' automatic ML video noise reduction. With temporal =
+ * off the trigger gates the one backend instead, and frames below the
+ * threshold are copied unchanged.
  */
 #include <errno.h>
 #include <getopt.h>
@@ -76,8 +81,14 @@ struct cam {
 	bool have_fmt;
 	int out_stride;
 
+	/* the temporal stage, or with temporal = off the gated backend */
 	const struct cdn_backend_ops *ops;
 	void *bstate;
+	/* the low-light stage on top of the temporal one, if a plugin runs */
+	const struct cdn_backend_ops *ml_ops;
+	void *ml_state;
+	uint8_t *stage;
+	size_t stage_size;
 	struct cdn_trigger trig;
 	struct cdn_gain gain;
 	bool gain_tried;
@@ -91,7 +102,7 @@ struct cam {
 	size_t copy_size;
 
 	/* stats */
-	uint64_t frames, denoised;
+	uint64_t frames, denoised, boosted;
 	double busy_ms, copy_ms;
 	uint64_t last_pts;
 	float fps_meas;
@@ -195,10 +206,11 @@ static void log_stats(struct cam *c, float strength, uint32_t gain, float noise)
 		return;
 	c->last_log = now;
 	fprintf(stderr,
-		"camera-denoise: %s: %llu frames, %llu denoised, %.2f ms per denoised frame "
-		"(%.2f ms of it copying), gain %u, noise %.2f, fps %.1f, strength %.2f\n",
+		"camera-denoise: %s: %llu frames, %llu denoised, %llu low-light, %.2f ms per "
+		"denoised frame (%.2f ms of it copying), gain %u, noise %.2f, fps %.1f, "
+		"low-light strength %.2f\n",
 		c->src_nick, (unsigned long long)c->frames, (unsigned long long)c->denoised,
-		c->denoised ? c->busy_ms / c->denoised : 0.0,
+		(unsigned long long)c->boosted, c->denoised ? c->busy_ms / c->denoised : 0.0,
 		c->denoised ? c->copy_ms / c->denoised : 0.0, gain, noise, c->fps_meas, strength);
 }
 
@@ -272,8 +284,11 @@ static void on_in_process(void *data)
 	strength = cdn_trigger_step(&c->trig, gain, noise, fps);
 	c->frames++;
 
-	if (strength > 0 && c->bstate) {
+	bool temporal = c->app->cfg.temporal && c->app->cfg.mode != CDN_MODE_OFF;
+
+	if ((temporal || strength > 0) && c->bstate) {
 		struct cdn_frame_info info = { gain, exposure, ih ? (uint64_t)ih->pts : 0 };
+		bool boost = temporal && c->ml_state && strength > 0;
 		double t0 = mono_ms();
 		size_t need = (size_t)w * h * 3 / 2;
 
@@ -292,8 +307,26 @@ static void on_in_process(void *data)
 			fi = cf;
 		}
 		c->copy_ms += mono_ms() - t0;
-		if (c->ops->process(c->bstate, &fi, &fo, &info, strength))
+		if (boost && c->stage_size < need) {
+			free(c->stage);
+			c->stage = malloc(need);
+			c->stage_size = c->stage ? need : 0;
+		}
+		if (boost && c->stage) {
+			/* temporal result B, then the low-light stage blends a*M(B) over it */
+			struct cdn_frame sf = { c->stage, c->stage + (size_t)w * h, w, h, w, w };
+
+			if (c->ops->process(c->bstate, &fi, &sf, &info, 1.0f))
+				cdn_frame_copy(&fi, &sf);
+			if (c->ml_ops->process(c->ml_state, &sf, &fo, &info, strength))
+				cdn_frame_copy(&sf, &fo);
+			c->boosted++;
+		} else if (c->ops->process(c->bstate, &fi, &fo, &info,
+					   temporal ? 1.0f : strength)) {
 			cdn_frame_copy(&fi, &fo);
+		}
+		if (!boost && c->ml_state && c->ml_ops->reset)
+			c->ml_ops->reset(c->ml_state);
 		c->busy_ms += mono_ms() - t0;
 		c->denoised++;
 	} else {
@@ -405,6 +438,8 @@ static void cam_stop_input(struct cam *c)
 	cdn_noise_tracker_reset(&c->noise);
 	if (c->bstate && c->ops->reset)
 		c->ops->reset(c->bstate);
+	if (c->ml_state && c->ml_ops->reset)
+		c->ml_ops->reset(c->ml_state);
 }
 
 /* ---------------------------------------------------------------------- */
@@ -418,6 +453,30 @@ static void setup_backend(struct cam *c)
 	if (c->bstate)
 		c->ops->destroy(c->bstate);
 	c->bstate = NULL;
+	if (c->ml_state)
+		c->ml_ops->destroy(c->ml_state);
+	c->ml_state = NULL;
+	c->ml_ops = NULL;
+
+	if (cfg->temporal) {
+		/* the CPU temporal filter always, a plugin on top for low light */
+		c->ops = cdn_cpu_backend();
+		c->bstate = c->ops->create(w, h, cfg->threads);
+		c->ml_ops = cdn_backend_find(cfg->backend, cfg->prefer);
+		if (c->ml_ops == cdn_cpu_backend())
+			c->ml_ops = NULL;
+		if (c->ml_ops)
+			c->ml_state = c->ml_ops->create(w, h, cfg->threads);
+		if (c->ml_ops && !c->ml_state)
+			fprintf(stderr, "camera-denoise: backend %s unavailable for %dx%d, "
+				"temporal filter only\n", c->ml_ops->name, w, h);
+		fprintf(stderr, "camera-denoise: %s: %dx%d@%u/%u, temporal %s, low light %s\n",
+			c->src_nick, w, h, c->fmt.framerate.num, c->fmt.framerate.denom,
+			c->bstate ? c->ops->name : "none",
+			c->ml_state ? c->ml_ops->name : "none");
+		return;
+	}
+
 	c->ops = cdn_backend_find(cfg->backend, cfg->prefer);
 	if (c->ops)
 		c->bstate = c->ops->create(w, h, cfg->threads);
@@ -686,8 +745,11 @@ static void cam_destroy(struct cam *c)
 		free(c->formats[i]);
 	if (c->bstate)
 		c->ops->destroy(c->bstate);
+	if (c->ml_state)
+		c->ml_ops->destroy(c->ml_state);
 	cdn_noise_tracker_free(&c->noise);
 	free(c->copy);
+	free(c->stage);
 	spa_list_remove(&c->link);
 	free(c);
 }
@@ -705,8 +767,8 @@ static void on_global(void *data, uint32_t id, uint32_t perms, const char *type,
 	cls = spa_dict_lookup(props, PW_KEY_MEDIA_CLASS);
 	if (!cls || strcmp(cls, "Video/Source") || spa_dict_lookup(props, OWN_PROP))
 		return;
-	/* nothing to decide on and not forced on: leave cameras alone */
-	if (a->cfg.mode != CDN_MODE_ON && !a->cfg.trig.enter_gain &&
+	/* no temporal filter, nothing to decide on and not forced on: leave cameras alone */
+	if (!a->cfg.temporal && a->cfg.mode != CDN_MODE_ON && !a->cfg.trig.enter_gain &&
 	    a->cfg.trig.enter_noise <= 0) {
 		static bool said;
 		if (!said)
