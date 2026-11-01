@@ -28,6 +28,14 @@ core = static_library('cdn-core',
   dependencies : [threads, dl, m])
 core_dep = declare_dependency(link_with : core, dependencies : [threads, dl, m])
 
+fixture = shared_module('backend-fixture', 'tests/backend_fixture.c', name_prefix : '')
+fixture_bad = shared_module('backend-fixture-bad', 'tests/backend_fixture.c',
+  name_prefix : '', c_args : ['-DBAD_ABI'])
+fixture_legacy = shared_module('backend-fixture-legacy', 'tests/backend_fixture.c',
+  name_prefix : '', c_args : ['-DLEGACY'])
+test('loader', executable('test_loader', 'tests/test_loader.c', dependencies : core_dep),
+  args : [meson.current_build_dir(), fixture.full_path(), fixture_bad.full_path(), fixture_legacy.full_path()])
+
 vulkan = dependency('vulkan', version : '>= 1.1', required : get_option('gpu'))
 glslang = find_program('glslangValidator', required : get_option('gpu'))
 if vulkan.found() and glslang.found() and not get_option('gpu').disabled()

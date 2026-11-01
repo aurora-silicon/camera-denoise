@@ -20,8 +20,9 @@ void cdn_frame_copy(const struct cdn_frame *in, struct cdn_frame *out)
 		       in->uv + (size_t)y * in->stride_uv, (size_t)in->width);
 }
 
-/* Plugins are loaded on the main thread before streaming. Cache one dlopen
- * per name, including failures, so format renegotiation does not leak handles. */
+/* Plugins are loaded on the main thread before streaming. Cache successful
+ * loads so renegotiation does not leak handles. Retry failures on reload,
+ * allowing a newly installed plugin to become available without a restart. */
 static struct plugin {
 	char name[65];
 	const struct cdn_backend_ops *ops;
@@ -53,8 +54,6 @@ static const struct cdn_backend_ops *load_plugin(const char *name)
 			return plugins[i].ops;
 	if (nplugins == sizeof(plugins) / sizeof(plugins[0]))
 		return NULL;
-	p = &plugins[nplugins++];
-	snprintf(p->name, sizeof(p->name), "%s", name);
 	const char *dir = getenv("CDN_BACKEND_DIR");
 	if (!dir || !*dir) dir = CDN_BACKEND_DIR;
 	if (snprintf(path, sizeof(path), "%s/cdn-backend-%s.so", dir, name) >= (int)sizeof(path))
@@ -71,6 +70,8 @@ static const struct cdn_backend_ops *load_plugin(const char *name)
 		dlclose(dl);
 		return NULL;
 	}
+	p = &plugins[nplugins++];
+	snprintf(p->name, sizeof(p->name), "%s", name);
 	p->ops = ops;
 	dmabuf_entry = (cdn_backend_dmabuf_entry_fn)dlsym(dl, CDN_DMABUF_ENTRY);
 	p->dmabuf = dmabuf_entry ? dmabuf_entry() : NULL;
