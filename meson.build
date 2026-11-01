@@ -38,7 +38,11 @@ test('loader', executable('test_loader', 'tests/test_loader.c', dependencies : c
 
 vulkan = dependency('vulkan', version : '>= 1.1', required : get_option('gpu'))
 glslang = find_program('glslangValidator', required : get_option('gpu'))
-if vulkan.found() and glslang.found() and not get_option('gpu').disabled()
+gpu_headers = false
+if vulkan.found()
+  gpu_headers = cc.has_header('vulkan/vulkan.h', dependencies : vulkan, required : get_option('gpu'))
+endif
+if vulkan.found() and glslang.found() and gpu_headers and not get_option('gpu').disabled()
   python = import('python').find_installation('python3')
   spirv = []
   foreach shader : ['filter', 'noise']
