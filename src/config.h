@@ -15,6 +15,11 @@ struct cdn_config {
 	 * trigger then only decides when the low-light stage joins in.
 	 */
 	bool temporal;
+	/*
+	 * Let the camera slow down to 15 fps in low light for a longer exposure,
+	 * as macOS does (MinFrameRateOverride 15), instead of raising the gain.
+	 */
+	bool low_light_frame_rate;
 	char backend[32];	/* auto, cpu or a plugin name */
 	char prefer[64];	/* plugins "auto" tries before cpu */
 	int threads;		/* 0: backend default */
