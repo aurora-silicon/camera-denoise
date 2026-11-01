@@ -22,6 +22,13 @@ uint32_t cdn_gain_read(struct cdn_gain *g, uint32_t *exposure_us);
 void cdn_gain_close(struct cdn_gain *g);
 
 /*
+ * Let auto exposure lower the frame rate in low light (V4L2_CID_EXPOSURE_AUTO_PRIORITY),
+ * as macOS lets the built-in camera drop to 15 fps. Must be set before the device
+ * streams. Returns 0, or -errno (no such control, device busy, no permission).
+ */
+int cdn_v4l2_set_exposure_priority(const char *path, bool on);
+
+/*
  * Luma noise from frame to frame, in 8-bit code values (a std-like scale):
  * the median |difference| from the previous frame on a sparse grid, per
  * block, then the median over blocks, so texture does not count (unlike a

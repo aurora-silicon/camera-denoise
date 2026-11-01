@@ -419,6 +419,17 @@ static int cam_start_input(struct cam *c)
 
 	r.format = SPA_VIDEO_FORMAT_NV12;
 	params[0] = spa_format_video_raw_build(&b, SPA_PARAM_EnumFormat, &r);
+	/*
+	 * Before the camera streams: may it slow down in low light? A camera
+	 * that is already streaming for another client keeps its setting.
+	 */
+	if (c->v4l2_path[0]) {
+		int err = cdn_v4l2_set_exposure_priority(c->v4l2_path,
+							 c->app->cfg.low_light_frame_rate);
+		if (err && err != -ENOTTY)
+			fprintf(stderr, "camera-denoise: %s: low-light frame rate not set: %s\n",
+				c->src_nick, strerror(-err));
+	}
 	c->last_pts = 0;
 	c->fps_meas = 0;
 	return pw_stream_connect(c->in, PW_DIRECTION_INPUT, PW_ID_ANY,
