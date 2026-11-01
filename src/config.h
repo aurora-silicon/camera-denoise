@@ -20,6 +20,12 @@ struct cdn_config {
 	 * as macOS does (MinFrameRateOverride 15), instead of raising the gain.
 	 */
 	bool low_light_frame_rate;
+	/*
+	 * Where the temporal filter runs. auto: the video encoder's motion-
+	 * compensated filter (the "ave" plugin), as on macOS, when the driver
+	 * offers it, else the CPU. cpu, or a plugin name.
+	 */
+	char temporal_backend[32];
 	char backend[32];	/* auto, cpu or a plugin name */
 	char prefer[64];	/* plugins "auto" tries before cpu */
 	int threads;		/* 0: backend default */

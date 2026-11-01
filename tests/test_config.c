@@ -26,7 +26,7 @@ int main(int argc, char **argv)
 	      "[apple,j700]\nenter-gain = 2304  # Neo\nexit-gain = 1792\nramp-down-frames = 30\n", f);
 	fclose(f);
 	f = fopen(user, "w");
-	fputs("[denoise]\nmode = on\nbackend = cpu\nexit-gain = 1500\ntemporal = off\nlow-light-frame-rate = off\n", f);
+	fputs("[denoise]\nmode = on\nbackend = cpu\nexit-gain = 1500\ntemporal = off\ntemporal-backend = cpu\nlow-light-frame-rate = off\n", f);
 	fclose(f);
 	f = fopen(bad, "w");
 	fputs("[denoise]\nmode = sometimes\n", f);
@@ -37,12 +37,14 @@ int main(int argc, char **argv)
 	CHECK(c.trig.enter_gain == 2304 && c.trig.exit_gain == 1792);
 	CHECK(c.mode == CDN_MODE_AUTO && !strcmp(c.backend, "auto"));
 	CHECK(c.temporal);
+	CHECK(!strcmp(c.temporal_backend, "auto"));
 	CHECK(c.low_light_frame_rate);
 
 	const char *s1[] = { "/nonexistent", user };
 	CHECK(cdn_config_load(&c, compat, boards, s1, 2) == 0);
 	CHECK(c.mode == CDN_MODE_ON && !strcmp(c.backend, "cpu"));
 	CHECK(!c.temporal);
+	CHECK(!strcmp(c.temporal_backend, "cpu"));
 	CHECK(!c.low_light_frame_rate);
 	CHECK(c.trig.enter_gain == 2304 && c.trig.exit_gain == 1500);
 

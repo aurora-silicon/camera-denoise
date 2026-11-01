@@ -34,6 +34,13 @@ if pipewire.found()
     dependencies : [core_dep, pipewire], install : true)
 endif
 
+# The encoder MCTF temporal backend (Linux V4L2 mem2mem), loaded as a plugin.
+if host_machine.system() == 'linux' and cc.has_header('linux/videodev2.h')
+  shared_module('cdn-backend-ave', 'src/ave/backend_ave.c',
+    name_prefix : '', gnu_symbol_visibility : 'hidden',
+    install : true, install_dir : backenddir)
+endif
+
 executable('aurora-camera-denoise-bench', 'tools/cdn-bench.c',
   dependencies : core_dep, install : true)
 executable('aurora-camera-denoise-metrics', 'tools/cdn-metrics.c',
@@ -59,3 +66,4 @@ test('cpu', executable('test_cpu', 'tests/test_cpu.c', dependencies : core_dep))
 test('trigger', executable('test_trigger', 'tests/test_trigger.c', dependencies : core_dep))
 test('config', executable('test_config', 'tests/test_config.c', dependencies : core_dep),
   args : [meson.current_build_dir()])
+test('mctf_level', executable('test_mctf_level', 'tests/test_mctf_level.c'))
