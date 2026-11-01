@@ -21,7 +21,6 @@
 #include <getopt.h>
 #include <limits.h>
 #include <math.h>
-#include <poll.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -38,6 +37,7 @@
 #include "backend.h"
 #include "config.h"
 #include "gain.h"
+#include "pipewire-frame.h"
 #include "trigger.h"
 
 #ifndef CDN_DATADIR
@@ -171,43 +171,6 @@ static bool driver_listed(const struct app *a, const char *drv)
 /* ---------------------------------------------------------------------- */
 /* frame plumbing                                                          */
 
-static bool frame_from_buffer(struct spa_buffer *b, const struct spa_video_info_raw *f,
-			      struct cdn_frame *fr)
-{
-	struct spa_data *d = &b->datas[0];
-	int w = (int)f->size.width, h = (int)f->size.height;
-
-	if (!d->data || !d->chunk)
-		return false;
-	/* The camera normally dequeues only completed frames. Also honor any
-	 * implicit writer fence before the CPU noise trigger reads mapped data. */
-	for (uint32_t i = 0; i < b->n_datas && i < 2; i++) {
-		if (b->datas[i].type != SPA_DATA_DmaBuf) continue;
-		struct pollfd p = { .fd = (int)b->datas[i].fd, .events = POLLIN };
-		int rc;
-		do { rc = poll(&p, 1, 1000); } while (rc < 0 && errno == EINTR);
-		if (rc <= 0 || !(p.revents & POLLIN) || (p.revents & (POLLERR | POLLNVAL))) return false;
-	}
-	fr->width = w;
-	fr->height = h;
-	fr->stride_y = d->chunk->stride > 0 ? d->chunk->stride : w;
-	fr->y = (uint8_t *)d->data + d->chunk->offset;
-	if (b->n_datas >= 2 && b->datas[1].data && b->datas[1].chunk) {
-		struct spa_data *u = &b->datas[1];
-		fr->uv = (uint8_t *)u->data + u->chunk->offset;
-		fr->stride_uv = u->chunk->stride > 0 ? u->chunk->stride : fr->stride_y;
-	} else {
-		size_t need = (size_t)fr->stride_y * h * 3 / 2;
-		if (d->chunk->size && d->chunk->size < need)
-			return false;
-		if (d->maxsize < d->chunk->offset + need)
-			return false;
-		fr->uv = fr->y + (size_t)fr->stride_y * h;
-		fr->stride_uv = fr->stride_y;
-	}
-	return true;
-}
-
 static void log_stats(struct cam *c, float strength, uint32_t gain, float noise)
 {
 	time_t now = time(NULL);
@@ -229,23 +192,6 @@ static double mono_ms(void)
 	struct timespec ts;
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
-}
-
-static bool frame_dmabuf(struct spa_buffer *b, const struct cdn_frame *f,
-			 struct cdn_dmabuf *dma)
-{
-	if (!b->n_datas) return false;
-	struct spa_data *y = &b->datas[0], *uv = b->n_datas >= 2 ? &b->datas[1] : y;
-	if (y->type != SPA_DATA_DmaBuf || uv->type != SPA_DATA_DmaBuf ||
-	    !y->chunk || !uv->chunk || y->fd < 0 || uv->fd < 0) return false;
-	uint64_t yo = (uint64_t)y->mapoffset + y->chunk->offset;
-	uint64_t uo = b->n_datas >= 2 ? (uint64_t)uv->mapoffset + uv->chunk->offset :
-		yo + (uint64_t)f->stride_y*f->height;
-	if (yo > UINT32_MAX || uo > UINT32_MAX) return false;
-	*dma = (struct cdn_dmabuf){ f->width, f->height,
-		{ (int)y->fd, (uint32_t)yo, (uint32_t)f->stride_y },
-		{ (int)uv->fd, (uint32_t)uo, (uint32_t)f->stride_uv } };
-	return true;
 }
 
 static int temporal_process(struct cam *c, const struct cdn_frame *in,
@@ -296,7 +242,7 @@ static void on_in_process(void *data)
 	h = (int)c->fmt.size.height;
 
 	struct spa_data *od = &ob->buffer->datas[0];
-	if (!frame_from_buffer(ib->buffer, &c->fmt, &fi) || !od->data ||
+	if (!cdn_frame_from_buffer(ib->buffer, &c->fmt, &fi) || !od->data ||
 	    od->maxsize < (uint32_t)c->out_stride * h * 3 / 2) {
 		pw_stream_queue_buffer(c->in, ib);
 		pw_stream_queue_buffer(c->out, ob);
@@ -342,7 +288,7 @@ static void on_in_process(void *data)
 
 		struct cdn_dmabuf dma, *dma_in = NULL;
 		const struct cdn_backend_dmabuf_ops *ext = cdn_backend_dmabuf(c->ops);
-		if (frame_dmabuf(ib->buffer, &fi, &dma)) dma_in = &dma;
+		if (cdn_frame_dmabuf(ib->buffer, &fi, &dma)) dma_in = &dma;
 		bool cached_copy = !ext || !(ext->flags & CDN_BACKEND_SINGLE_UPLOAD);
 		/*
 		 * Every CPU pass reads the input, so read the camera's buffer once,

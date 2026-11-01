@@ -46,13 +46,15 @@ if vulkan.found() and glslang.found() and not get_option('gpu').disabled()
     name_prefix : '', dependencies : [vulkan, m], install : true, install_dir : backenddir)
   test_gpu = executable('test_gpu', 'tests/test_gpu.c', dependencies : core_dep)
   test('gpu', test_gpu, args : [gpu.full_path()],
-    env : ['CDN_GPU_ALLOW_SOFTWARE=1'], timeout : 180)
+    env : ['CDN_GPU_ALLOW_SOFTWARE=1', 'LP_NUM_THREADS=4'], timeout : 180)
 endif
 
 pipewire = dependency('libpipewire-0.3', version : '>= 1.0', required : get_option('daemon'))
 if pipewire.found()
-  executable('aurora-camera-denoise', 'src/main.c',
+  executable('aurora-camera-denoise', 'src/main.c', 'src/pipewire-frame.c',
     dependencies : [core_dep, pipewire], install : true)
+  test('buffers', executable('test_buffers', 'tests/test_buffers.c', 'src/pipewire-frame.c',
+    dependencies : [core_dep, pipewire]))
 endif
 
 executable('aurora-camera-denoise-bench', 'tools/cdn-bench.c',

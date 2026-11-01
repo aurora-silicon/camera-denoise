@@ -178,7 +178,7 @@ static int init(struct gpu *s)
 		VkPhysicalDeviceProperties prop;
 		vkGetPhysicalDeviceProperties(devices[i], &prop);
 		if (prop.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU && !getenv("CDN_GPU_ALLOW_SOFTWARE")) continue;
-		if (prop.apiVersion < VK_API_VERSION_1_1 || prop.limits.maxPerStageDescriptorStorageBuffers < 6 ||
+		if (prop.apiVersion < VK_API_VERSION_1_1 || prop.limits.maxPerStageDescriptorStorageBuffers < 6 || prop.limits.maxDescriptorSetStorageBuffers < 6 ||
 		    (uint64_t)s->w*s->h > (uint64_t)prop.limits.maxComputeWorkGroupCount[0]*128 || prop.limits.maxComputeWorkGroupInvocations < 128 || prop.limits.maxComputeWorkGroupSize[0] < 128 ||
 		    prop.limits.maxStorageBufferRange < (uint64_t)s->w*s->h*20) continue;
 		uint32_t n = 0;
