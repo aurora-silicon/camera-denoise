@@ -43,6 +43,26 @@ that into failure. The test enables software Vulkan explicitly; production
 selection rejects CPU devices unless `CDN_GPU_ALLOW_SOFTWARE` is set.
 Software Vulkan results establish correctness, not Apple GPU performance.
 
+`test_gpu_dmabuf` exports real Vulkan DMA-BUF pools and calls the import
+entry directly. Shared and split fds, independent padded strides, odd byte
+offsets, pool reuse, reset and rejected bounds must all remain byte-exact
+against CPU. It skips when export support is unavailable; set
+`CDN_TEST_REQUIRE_DMABUF=1` to require it.
+
+Validated on 2026-11-01 with Radeon RX 7900 XTX / RADV NAVI31:
+
+- GPU-enabled build with warnings as errors: **7/7 tests passed**.
+- GPU-disabled build with warnings as errors: **5/5 tests passed**.
+- Upload path: 64 generated frames at each of five geometries through
+  1920x1080, maximum byte error **0**, equal noise estimates.
+- Import path: 24 frames for each of shared-fd and split-fd pools,
+  maximum byte error **0**; the plugin logged imported input with no upload.
+- Offline 12-frame 1080p NV12 benchmark: paired Y/UV PSNR **infinite**
+  (byte equality), including every frame.
+
+These checks use generated inputs and Vulkan-exported allocations. The
+camera-exporter and Apple GPU measurements below remain for the on-device run.
+
 ## Buffer transport and synchronization
 
 ABI v1's `cdn_backend_ops` and `cdn_frame` remain unchanged. A plugin can
@@ -125,10 +145,16 @@ live camera measurements or establish system power savings.
 
 ## Measurement status
 
-| Device | Backend | Latency p50 / p95 (ms) | Process CPU at 1080p30 | GPU busy | System power (PMP/SMC) | Parity vs CPU |
+Earlier CPU-only live reference rows report ranges of logged means. A
+paired CPU/GPU run with per-frame percentiles, GPU busy and system power is
+still required on each target.
+
+| Device | Backend | Filter latency (ms; statistic) | Process CPU at 1080p30 | GPU busy | System power (PMP/SMC) | Parity vs CPU |
 | --- | --- | --- | --- | --- | --- | --- |
-| Neo / G17 | CPU / GPU | pending lead run | pending | pending | pending | pending recorded frames |
-| J616s / G16 | CPU / GPU | pending lead run | pending | pending | pending | pending recorded frames |
+| Neo / G17 | CPU, earlier live reference | 15.1–15.3, logged means | 46% of one core | unmeasured | unmeasured | reference |
+| Neo / G17 | GPU | pending lead run | pending | pending | pending | pending recorded frames |
+| J616s / G16 | CPU, earlier live reference | 15.1–17.1, logged means | 48% of one core | unmeasured | unmeasured | reference |
+| J616s / G16 | GPU | pending lead run | pending | pending | pending | pending recorded frames |
 | M1 Pro / G13 | CPU / GPU | pending lead run | pending | pending | pending | pending recorded frames |
 | M2 / G14 | CPU / GPU | pending lead run | pending | pending | pending | pending recorded frames |
 
