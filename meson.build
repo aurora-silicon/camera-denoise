@@ -59,6 +59,9 @@ if vulkan.found() and glslang.found() and gpu_headers and not get_option('gpu').
   test_gpu = executable('test_gpu', 'tests/test_gpu.c', dependencies : core_dep)
   test('gpu', test_gpu, args : [gpu.full_path()],
     env : ['CDN_GPU_ALLOW_SOFTWARE=1', 'LP_NUM_THREADS=4'], timeout : 180)
+  test('gpu-dmabuf', executable('test_gpu_dmabuf', 'tests/test_gpu_dmabuf.c',
+    dependencies : [core_dep, vulkan]), args : [gpu.full_path()],
+    env : ['CDN_GPU_ALLOW_SOFTWARE=1', 'LP_NUM_THREADS=4'], timeout : 180)
 endif
 
 pipewire = dependency('libpipewire-0.3', version : '>= 1.0', required : get_option('daemon'))
