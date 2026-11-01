@@ -40,6 +40,8 @@ executable('aurora-camera-denoise-metrics', 'tools/cdn-metrics.c',
   dependencies : m, install : true)
 # motion trail benchmark (synthetic, needs no capture): not installed
 executable('cdn-motion', 'tools/cdn-motion.c', dependencies : core_dep)
+# the same artefacts on a real luma-only capture: not installed
+executable('cdn-yeval', 'tools/cdn-yeval.c', dependencies : [core_dep, m])
 
 install_data('data/boards.conf', install_dir : pkgdatadir)
 install_data('data/denoise.conf', install_dir : pkgdatadir / 'examples')

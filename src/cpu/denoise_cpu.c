@@ -6,12 +6,14 @@
  *    12-bit history (8.4 fixed point). Three tests of frame - history
  *    against the estimated noise measure motion: the 3x3 sum of its
  *    magnitude, and the 5x5 and 9x9 sums of its sign, which see faint
- *    changes over larger areas. Static pixels blend in 1/8 of the new
+ *    changes over larger areas. The weight is then averaged over 5x5, so
+ *    neighbours restart together. Static pixels blend in 1/8 of the new
  *    frame (about 15 frames of averaging), moving pixels take the new
  *    frame as is, so motion does not smear.
- * 2. Spatial: an edge-clipped 3x3 mean on luma, whose clip level follows
- *    the temporal weight: where motion stopped the temporal filter, the
- *    spatial filter does the work; on static areas it hardly acts.
+ * 2. Spatial: edge-clipped 3x3 means on luma at distance 1 and 2, whose
+ *    clip levels follow the temporal weight: where motion stopped the
+ *    temporal filter, the spatial filter does the work; on static areas it
+ *    hardly acts.
  * 3. Chroma: the same temporal filter driven by the luma motion of its 2x2
  *    block, then two edge-clipped passes (distance 1 and 2), since low-light
  *    chroma noise is blotchy and low-frequency.
@@ -77,8 +79,8 @@ struct cdn_cpu {
 	uint8_t *dy;
 	int8_t *ds;
 	int16_t *hs, *hs9;
-	uint16_t *ky;
-	uint8_t *ty, *tuv, *tuv2;
+	uint16_t *ky, *kh;
+	uint8_t *ty, *ty2, *tuv, *tuv2;
 	/* frames averaged into each luma pixel's history since motion reset it */
 	uint8_t *age;
 
@@ -409,7 +411,7 @@ static void pass_diff(struct cdn_cpu *s, int y0, int y1)
 }
 
 /* ---------------------------------------------------------------------- */
-/* pass 2: motion weight + luma temporal                                   */
+/* pass 2: motion weight, then luma temporal                              */
 
 static inline uint16_t ramp(int m, int lo, int range, int scale, int shift)
 {
@@ -430,13 +432,15 @@ static inline uint16_t weight_scalar(const struct cdn_cpu *s, int m, int a, int 
 	return (uint16_t)(s->kmin + (w9 > wm ? w9 : wm));
 }
 
-static void pass_temporal_y(struct cdn_cpu *s, int y0, int y1)
+/*
+ * Pass 2a: the motion weight of each pixel, into ky, and its horizontal
+ * 5-sum (in 1/16 steps, so 25 of them fit 16 bits) into kh.
+ */
+static void pass_motion_y(struct cdn_cpu *s, int y0, int y1)
 {
-	const struct cdn_frame *in = s->in;
 	int w = s->w, h = s->h;
 
 	for (int y = y0; y < y1; y++) {
-		const uint8_t *src = in->y + (size_t)y * in->stride_y;
 		int ya = y > 0 ? y - 1 : 0, yb = y < h - 1 ? y + 1 : h - 1;
 		const uint8_t *da = s->dy + (size_t)ya * w, *db = s->dy + (size_t)y * w,
 			      *dc = s->dy + (size_t)yb * w;
@@ -451,14 +455,11 @@ static void pass_temporal_y(struct cdn_cpu *s, int y0, int y1)
 			yy = yy < 0 ? 0 : yy > h - 1 ? h - 1 : yy;
 			h9[j] = s->hs9 + (size_t)yy * w;
 		}
-		int16_t *hist = s->hy + (size_t)y * w;
 		uint16_t *k = s->ky + (size_t)y * w;
-		uint8_t *t = s->ty + (size_t)y * w;
-		uint8_t *age = s->age + (size_t)y * w;
+		uint16_t *kh = s->kh + (size_t)y * w;
 		int x = 0;
 
-		/* edge columns and the scalar tail */
-#define TEMPORAL_Y_SCALAR(X)                                                      \
+#define MOTION_Y_SCALAR(X)                                                        \
 	do {                                                                      \
 		int xl = (X) > 0 ? (X) - 1 : 0, xr = (X) < w - 1 ? (X) + 1 : w - 1; \
 		int m = da[xl] + da[X] + da[xr] + db[xl] + db[X] + db[xr] +      \
@@ -467,18 +468,10 @@ static void pass_temporal_y(struct cdn_cpu *s, int y0, int y1)
 		int bv = 0;                                                       \
 		for (int j = 0; j < 9; j++)                                       \
 			bv += h9[j][X];                                           \
-		uint16_t km = weight_scalar(s, m, av, bv);                        \
-		uint16_t ka = age_weight[age[X]];                                 \
-		uint16_t kk = km > ka ? km : ka;                                  \
-		age[X] = km > KMAX / 2 ? 1 : age[X] + 1 > AGE_MAX ? AGE_MAX : age[X] + 1; \
-		int16_t delta = (int16_t)((src[X] << 4) - hist[X]);               \
-		int16_t nh = (int16_t)(hist[X] + qrdmulh(delta, (int16_t)kk));    \
-		hist[X] = nh;                                                     \
-		k[X] = kk;                                                        \
-		t[X] = sat_u8((nh + 8) >> 4);                                     \
+		k[X] = weight_scalar(s, m, av, bv);                               \
 	} while (0)
 
-		TEMPORAL_Y_SCALAR(0);
+		MOTION_Y_SCALAR(0);
 		x = 1;
 #if CDN_NEON
 		if (s->use_neon) {
@@ -491,14 +484,6 @@ static void pass_temporal_y(struct cdn_cpu *s, int y0, int y1)
 			uint16x8_t blo = vdupq_n_u16(s->blo), brange = vdupq_n_u16(s->brange);
 			uint16x4_t bscale = vdup_n_u16(s->bscale);
 			int32x4_t nbsh = vdupq_n_s32(-s->bshift);
-			uint8_t tlo[16], thi[16];
-			for (int i = 0; i < 16; i++) {
-				tlo[i] = (uint8_t)age_weight[i];
-				thi[i] = (uint8_t)(age_weight[i] >> 8);
-			}
-			uint8x16_t rlo = vld1q_u8(tlo), rhi = vld1q_u8(thi);
-			uint16x8_t half = vdupq_n_u16(KMAX / 2);
-			uint8x8_t one = vdup_n_u8(1), amax = vdup_n_u8(AGE_MAX);
 			for (; x + 8 <= w - 1; x += 8) {
 				/* 3x3 sum in u16 */
 				uint16x8_t m = vdupq_n_u16(0);
@@ -530,7 +515,89 @@ static void pass_temporal_y(struct cdn_cpu *s, int y0, int y1)
 				uint32x4_t r1 = vmull_u16(vget_high_u16(f), bscale);
 				uint16x8_t w9 = vcombine_u16(vmovn_u32(vshlq_u32(r0, nbsh)),
 							     vmovn_u32(vshlq_u32(r1, nbsh)));
-				uint16x8_t km = vaddq_u16(kmin, vmaxq_u16(w9, vmaxq_u16(wa, wb)));
+				vst1q_u16(k + x, vaddq_u16(kmin, vmaxq_u16(w9, vmaxq_u16(wa, wb))));
+			}
+		}
+#endif
+		for (; x < w; x++)
+			MOTION_Y_SCALAR(x);
+#undef MOTION_Y_SCALAR
+
+		/* horizontal 5-sums of the weight in 1/16 steps, edges replicated */
+#define KH_SCALAR(X)                                                               \
+	do {                                                                       \
+		int acc = 0;                                                       \
+		for (int dx = -2; dx <= 2; dx++) {                                 \
+			int xx = (X) + dx;                                         \
+			xx = xx < 0 ? 0 : xx > w - 1 ? w - 1 : xx;                 \
+			acc += k[xx] >> 4;                                         \
+		}                                                                  \
+		kh[X] = (uint16_t)acc;                                             \
+	} while (0)
+		KH_SCALAR(0);
+		KH_SCALAR(1);
+		x = 2;
+#if CDN_NEON
+		if (s->use_neon)
+			for (; x + 8 <= w - 2; x += 8) {
+				uint16x8_t a = vshrq_n_u16(vld1q_u16(k + x - 2), 4);
+				a = vaddq_u16(a, vshrq_n_u16(vld1q_u16(k + x - 1), 4));
+				a = vaddq_u16(a, vshrq_n_u16(vld1q_u16(k + x), 4));
+				a = vaddq_u16(a, vshrq_n_u16(vld1q_u16(k + x + 1), 4));
+				a = vaddq_u16(a, vshrq_n_u16(vld1q_u16(k + x + 2), 4));
+				vst1q_u16(kh + x, a);
+			}
+#endif
+		for (; x < w; x++)
+			KH_SCALAR(x);
+#undef KH_SCALAR
+	}
+}
+
+/*
+ * Pass 2b: luma temporal. The motion weight is the 5x5 mean of the per-pixel
+ * weights, so a decision covers an area: pixels at the edge of a moving
+ * object restart averaging together with their neighbours instead of one
+ * here and one there, which left a halo of isolated raw dots, and a lone
+ * noise outlier on a static area no longer restarts its pixel.
+ * 16/25 = 41943 / 65536.
+ */
+static void pass_temporal_y(struct cdn_cpu *s, int y0, int y1)
+{
+	const struct cdn_frame *in = s->in;
+	int w = s->w, h = s->h;
+
+	for (int y = y0; y < y1; y++) {
+		const uint8_t *src = in->y + (size_t)y * in->stride_y;
+		const uint16_t *kr[5];
+		for (int j = 0; j < 5; j++) {
+			int yy = y + j - 2;
+			yy = yy < 0 ? 0 : yy > h - 1 ? h - 1 : yy;
+			kr[j] = s->kh + (size_t)yy * w;
+		}
+		int16_t *hist = s->hy + (size_t)y * w;
+		uint16_t *k = s->ky + (size_t)y * w;
+		uint8_t *t = s->ty + (size_t)y * w;
+		uint8_t *age = s->age + (size_t)y * w;
+		int x = 0;
+
+#if CDN_NEON
+		if (s->use_neon) {
+			uint8_t tlo[16], thi[16];
+			for (int i = 0; i < 16; i++) {
+				tlo[i] = (uint8_t)age_weight[i];
+				thi[i] = (uint8_t)(age_weight[i] >> 8);
+			}
+			uint8x16_t rlo = vld1q_u8(tlo), rhi = vld1q_u8(thi);
+			uint16x8_t half = vdupq_n_u16(KMAX / 2);
+			uint16x4_t mul = vdup_n_u16(41943);
+			uint8x8_t one = vdup_n_u8(1), amax = vdup_n_u8(AGE_MAX);
+			for (; x + 8 <= w; x += 8) {
+				uint16x8_t ks = vaddq_u16(vaddq_u16(vld1q_u16(kr[0] + x), vld1q_u16(kr[1] + x)),
+							  vaddq_u16(vld1q_u16(kr[2] + x), vld1q_u16(kr[3] + x)));
+				ks = vaddq_u16(ks, vld1q_u16(kr[4] + x));
+				uint16x8_t km = vcombine_u16(vshrn_n_u32(vmull_u16(vget_low_u16(ks), mul), 16),
+							     vshrn_n_u32(vmull_u16(vget_high_u16(ks), mul), 16));
 				uint8x8_t ag = vld1_u8(age + x);
 				uint16x8_t ka = vorrq_u16(vmovl_u8(vqtbl1_u8(rlo, ag)),
 							  vshlq_n_u16(vmovl_u8(vqtbl1_u8(rhi, ag)), 8));
@@ -547,87 +614,111 @@ static void pass_temporal_y(struct cdn_cpu *s, int y0, int y1)
 			}
 		}
 #endif
-		for (; x < w; x++)
-			TEMPORAL_Y_SCALAR(x);
-#undef TEMPORAL_Y_SCALAR
+		for (; x < w; x++) {
+			uint32_t ks = (uint32_t)kr[0][x] + kr[1][x] + kr[2][x] + kr[3][x] + kr[4][x];
+			uint16_t km = (uint16_t)((ks * 41943u) >> 16);
+			uint16_t ka = age_weight[age[x]];
+			uint16_t kk = km > ka ? km : ka;
+			age[x] = km > KMAX / 2 ? 1 : age[x] + 1 > AGE_MAX ? AGE_MAX : age[x] + 1;
+			int16_t delta = (int16_t)((src[x] << 4) - hist[x]);
+			int16_t nh = (int16_t)(hist[x] + qrdmulh(delta, (int16_t)kk));
+			hist[x] = nh;
+			k[x] = kk;
+			t[x] = sat_u8((nh + 8) >> 4);
+		}
 	}
 }
 
 /* ---------------------------------------------------------------------- */
-/* pass 3: luma spatial (edge-clipped 3x3 mean) + blend                    */
+/* pass 3: luma spatial, edge-clipped 3x3 means at distance 1 then 2       */
 
-static void pass_spatial_y(struct cdn_cpu *s, int y0, int y1)
+/*
+ * The clip level follows the temporal weight k. At distance 1 it is the full
+ * level times k, at least a quarter of it, so static areas get a light touch
+ * and moving ones a 2 sigma clip. The pass at distance 2 widens the filter
+ * to 5x5 where the temporal filter restarted, since camera noise is
+ * correlated over a few pixels and a 3x3 mean alone leaves moving areas
+ * grainy: its level is the full level times k - 1/8, nothing on static areas.
+ */
+static void pass_spatial_y(struct cdn_cpu *s, int y0, int y1, int dist, const uint8_t *tin,
+			   uint8_t *tout, bool final)
 {
 	const struct cdn_frame *in = s->in;
 	struct cdn_frame *out = s->out;
 	int w = s->w, h = s->h, str = s->strength8;
 	int16_t tsf = s->ts_y;          /* full clip level */
-	int16_t tfloor = (int16_t)((tsf + 3) >> 2);
+	int16_t tfloor = dist == 1 ? (int16_t)((tsf + 3) >> 2) : 0;
+	int16_t koff = dist == 1 ? 0 : KMAX / 8;
 
 	for (int y = y0; y < y1; y++) {
 		const uint8_t *src = in->y + (size_t)y * in->stride_y;
-		uint8_t *dst = out->y + (size_t)y * out->stride_y;
-		const uint8_t *t = s->ty + (size_t)y * w;
+		uint8_t *dst = final ? out->y + (size_t)y * out->stride_y : tout + (size_t)y * w;
+		const uint8_t *t = tin + (size_t)y * w;
 		const uint16_t *k = s->ky + (size_t)y * w;
-
-		if (y == 0 || y == h - 1) {
-			for (int x = 0; x < w; x++)
-				dst[x] = sat_u8(src[x] + (((t[x] - src[x]) * str + 128) >> 8));
-			continue;
-		}
-		const uint8_t *ta = t - w, *tc = t + w;
+		bool edge_row = y < dist || y >= h - dist;
+		const uint8_t *ta = edge_row ? t : t - (size_t)dist * w;
+		const uint8_t *tc = edge_row ? t : t + (size_t)dist * w;
 		int x = 0;
 
 #define SPATIAL_Y_SCALAR(X)                                                          \
 	do {                                                                         \
 		int c = t[X], v;                                                     \
-		if ((X) == 0 || (X) == w - 1) {                                      \
+		if (edge_row || (X) < dist || (X) >= w - dist) {                     \
 			v = c;                                                       \
 		} else {                                                             \
-			int16_t tt = qrdmulh(tsf, (int16_t)k[X]);                    \
+			int16_t tt = qrdmulh(tsf, (int16_t)(k[X] - koff));           \
 			if (tt < tfloor)                                             \
 				tt = tfloor;                                         \
-			int sum = clamp16(ta[(X) - 1] - c, -tt, tt) +                \
+			int sum = clamp16(ta[(X) - dist] - c, -tt, tt) +             \
 				  clamp16(ta[X] - c, -tt, tt) +                      \
-				  clamp16(ta[(X) + 1] - c, -tt, tt) +                \
-				  clamp16(t[(X) - 1] - c, -tt, tt) +                 \
-				  clamp16(t[(X) + 1] - c, -tt, tt) +                 \
-				  clamp16(tc[(X) - 1] - c, -tt, tt) +                \
+				  clamp16(ta[(X) + dist] - c, -tt, tt) +             \
+				  clamp16(t[(X) - dist] - c, -tt, tt) +              \
+				  clamp16(t[(X) + dist] - c, -tt, tt) +              \
+				  clamp16(tc[(X) - dist] - c, -tt, tt) +             \
 				  clamp16(tc[X] - c, -tt, tt) +                      \
-				  clamp16(tc[(X) + 1] - c, -tt, tt);                 \
+				  clamp16(tc[(X) + dist] - c, -tt, tt);              \
 			v = sat_u8(c + qrdmulh((int16_t)sum, 3641));                 \
 		}                                                                    \
-		dst[X] = sat_u8(src[X] + (((v - src[X]) * str + 128) >> 8));        \
+		if (final)                                                           \
+			dst[X] = sat_u8(src[X] + (((v - src[X]) * str + 128) >> 8)); \
+		else                                                                 \
+			dst[X] = (uint8_t)v;                                         \
 	} while (0)
 
-		SPATIAL_Y_SCALAR(0);
-		x = 1;
+		for (; x < dist; x++)
+			SPATIAL_Y_SCALAR(x);
 #if CDN_NEON
-		if (s->use_neon) {
+		if (s->use_neon && !edge_row) {
 			int16x8_t vts = vdupq_n_s16(tsf), vfl = vdupq_n_s16(tfloor);
+			int16x8_t vko = vdupq_n_s16(koff);
 			int16x8_t nine = vdupq_n_s16(3641);
 			int16x8_t vstr = vdupq_n_s16((int16_t)str);
-			for (; x + 8 <= w - 1; x += 8) {
+			for (; x + 8 <= w - dist; x += 8) {
 				int16x8_t c = vreinterpretq_s16_u16(vmovl_u8(vld1_u8(t + x)));
-				int16x8_t tt = vmaxq_s16(vqrdmulhq_s16(vts, vreinterpretq_s16_u16(vld1q_u16(k + x))), vfl);
+				int16x8_t kv = vsubq_s16(vreinterpretq_s16_u16(vld1q_u16(k + x)), vko);
+				int16x8_t tt = vmaxq_s16(vqrdmulhq_s16(vts, kv), vfl);
 				int16x8_t ntt = vnegq_s16(tt);
 				int16x8_t sum = vdupq_n_s16(0);
 #define ACC(P)                                                                         \
 	sum = vaddq_s16(sum, vmaxq_s16(vminq_s16(vsubq_s16(                             \
 		vreinterpretq_s16_u16(vmovl_u8(vld1_u8(P))), c), tt), ntt))
-				ACC(ta + x - 1); ACC(ta + x); ACC(ta + x + 1);
-				ACC(t + x - 1); ACC(t + x + 1);
-				ACC(tc + x - 1); ACC(tc + x); ACC(tc + x + 1);
+				ACC(ta + x - dist); ACC(ta + x); ACC(ta + x + dist);
+				ACC(t + x - dist); ACC(t + x + dist);
+				ACC(tc + x - dist); ACC(tc + x); ACC(tc + x + dist);
 #undef ACC
-				int16x8_t v = vreinterpretq_s16_u16(vmovl_u8(
-					vqmovun_s16(vaddq_s16(c, vqrdmulhq_s16(sum, nine)))));
-				int16x8_t sv = vreinterpretq_s16_u16(vmovl_u8(vld1_u8(src + x)));
-				/* src + ((v - src) * str + 128) >> 8 */
-				int16x8_t dd = vsubq_s16(v, sv);
-				int32x4_t a0 = vmull_s16(vget_low_s16(dd), vget_low_s16(vstr));
-				int32x4_t a1 = vmull_s16(vget_high_s16(dd), vget_high_s16(vstr));
-				int16x8_t adj = vcombine_s16(vrshrn_n_s32(a0, 8), vrshrn_n_s32(a1, 8));
-				vst1_u8(dst + x, vqmovun_s16(vaddq_s16(sv, adj)));
+				uint8x8_t v8 = vqmovun_s16(vaddq_s16(c, vqrdmulhq_s16(sum, nine)));
+				if (final) {
+					int16x8_t v = vreinterpretq_s16_u16(vmovl_u8(v8));
+					int16x8_t sv = vreinterpretq_s16_u16(vmovl_u8(vld1_u8(src + x)));
+					/* src + ((v - src) * str + 128) >> 8 */
+					int16x8_t dd = vsubq_s16(v, sv);
+					int32x4_t a0 = vmull_s16(vget_low_s16(dd), vget_low_s16(vstr));
+					int32x4_t a1 = vmull_s16(vget_high_s16(dd), vget_high_s16(vstr));
+					int16x8_t adj = vcombine_s16(vrshrn_n_s32(a0, 8), vrshrn_n_s32(a1, 8));
+					vst1_u8(dst + x, vqmovun_s16(vaddq_s16(sv, adj)));
+				} else {
+					vst1_u8(dst + x, v8);
+				}
 			}
 		}
 #endif
@@ -766,17 +857,21 @@ static void run_phase(struct cdn_cpu *s, int phase, int y0, int y1)
 {
 	switch (phase) {
 	case 0: pass_diff(s, y0, y1); break;
-	case 1: pass_temporal_y(s, y0, y1); break;
-	case 2:
-		pass_spatial_y(s, y0, y1);
+	case 1: pass_motion_y(s, y0, y1); break;
+	case 2: pass_temporal_y(s, y0, y1); break;
+	case 3:
+		pass_spatial_y(s, y0, y1, 1, s->ty, s->ty2, false);
 		pass_temporal_uv(s, y0, y1);
 		break;
-	case 3: pass_spatial_uv(s, y0, y1, 1, s->tuv, s->tuv2, false); break;
-	case 4: pass_spatial_uv(s, y0, y1, 2, s->tuv2, NULL, true); break;
+	case 4:
+		pass_spatial_y(s, y0, y1, 2, s->ty2, NULL, true);
+		pass_spatial_uv(s, y0, y1, 1, s->tuv, s->tuv2, false);
+		break;
+	case 5: pass_spatial_uv(s, y0, y1, 2, s->tuv2, NULL, true); break;
 	}
 }
 
-#define NPHASES 5
+#define NPHASES 6
 
 static void *worker(void *p)
 {
@@ -834,9 +929,11 @@ static void *cpu_create(int width, int height, int threads)
 	s->ky = malloc(n * 2);
 	s->age = malloc(n);
 	s->ty = malloc(n);
+	s->ty2 = malloc(n);
+	s->kh = malloc(n * 2);
 	s->tuv = malloc(n / 2);
 	s->tuv2 = malloc(n / 2);
-	if (!s->hy || !s->huv || !s->dy || !s->ds || !s->hs || !s->hs9 || !s->ky || !s->age || !s->ty || !s->tuv || !s->tuv2) {
+	if (!s->hy || !s->huv || !s->dy || !s->ds || !s->hs || !s->hs9 || !s->ky || !s->kh || !s->age || !s->ty || !s->ty2 || !s->tuv || !s->tuv2) {
 		cdn_cpu_destroy(s);
 		return NULL;
 	}
@@ -904,6 +1001,8 @@ void cdn_cpu_destroy(void *p)
 	free(s->ky);
 	free(s->age);
 	free(s->ty);
+	free(s->ty2);
+	free(s->kh);
 	free(s->tuv);
 	free(s->tuv2);
 	free(s);
