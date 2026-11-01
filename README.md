@@ -18,7 +18,7 @@ The levels are board data in `/usr/share/aurora-camera-denoise/boards.conf`, key
 | Board | On at gain | Off below | Noise on / off |
 | --- | --- | --- | --- |
 | MacBook Neo (`apple,j700`) | 2304 (9x) | 1792 (7x) | 7 / 5 |
-| MacBook Pro M5 Pro/Max (`apple,j616s`) | 3584 (14x) | 2816 (11x) | 7 / 5 |
+| MacBook Pro 16-inch M4 Pro (`apple,j616s`) | 3584 (14x) | 2816 (11x) | 7 / 5 |
 
 Kernels without the gain report fall back to the noise signal alone.
 
