@@ -13,7 +13,7 @@ static void defaults(struct cdn_config *c)
 	c->mode = CDN_MODE_AUTO;
 	c->temporal = true;
 	c->low_light_frame_rate = true;
-	snprintf(c->temporal_backend, sizeof(c->temporal_backend), "auto");
+	snprintf(c->temporal_backend, sizeof(c->temporal_backend), "cpu");
 	snprintf(c->backend, sizeof(c->backend), "auto");
 	snprintf(c->prefer, sizeof(c->prefer), "ane");
 	snprintf(c->drivers, sizeof(c->drivers), "apple-isp");

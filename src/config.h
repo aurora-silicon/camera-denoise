@@ -21,9 +21,9 @@ struct cdn_config {
 	 */
 	bool low_light_frame_rate;
 	/*
-	 * Where the temporal filter runs. auto: the video encoder's motion-
-	 * compensated filter (the "ave" plugin), as on macOS, when the driver
-	 * offers it, else the CPU. cpu, or a plugin name.
+	 * Where the temporal filter runs: cpu (default), ave (the video encoder's
+	 * motion-compensated filter), auto (ave when offered, else cpu), or a
+	 * plugin name.
 	 */
 	char temporal_backend[32];
 	char backend[32];	/* auto, cpu or a plugin name */
