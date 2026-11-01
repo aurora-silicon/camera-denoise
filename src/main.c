@@ -21,6 +21,7 @@
 #include <getopt.h>
 #include <limits.h>
 #include <math.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -178,6 +179,15 @@ static bool frame_from_buffer(struct spa_buffer *b, const struct spa_video_info_
 
 	if (!d->data || !d->chunk)
 		return false;
+	/* The camera normally dequeues only completed frames. Also honor any
+	 * implicit writer fence before the CPU noise trigger reads mapped data. */
+	for (uint32_t i = 0; i < b->n_datas && i < 2; i++) {
+		if (b->datas[i].type != SPA_DATA_DmaBuf) continue;
+		struct pollfd p = { .fd = (int)b->datas[i].fd, .events = POLLIN };
+		int rc;
+		do { rc = poll(&p, 1, 1000); } while (rc < 0 && errno == EINTR);
+		if (rc <= 0 || !(p.revents & POLLIN) || (p.revents & (POLLERR | POLLNVAL))) return false;
+	}
 	fr->width = w;
 	fr->height = h;
 	fr->stride_y = d->chunk->stride > 0 ? d->chunk->stride : w;
@@ -219,6 +229,44 @@ static double mono_ms(void)
 	struct timespec ts;
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
+}
+
+static bool frame_dmabuf(struct spa_buffer *b, const struct cdn_frame *f,
+			 struct cdn_dmabuf *dma)
+{
+	if (!b->n_datas) return false;
+	struct spa_data *y = &b->datas[0], *uv = b->n_datas >= 2 ? &b->datas[1] : y;
+	if (y->type != SPA_DATA_DmaBuf || uv->type != SPA_DATA_DmaBuf ||
+	    !y->chunk || !uv->chunk || y->fd < 0 || uv->fd < 0) return false;
+	uint64_t yo = (uint64_t)y->mapoffset + y->chunk->offset;
+	uint64_t uo = b->n_datas >= 2 ? (uint64_t)uv->mapoffset + uv->chunk->offset :
+		yo + (uint64_t)f->stride_y*f->height;
+	if (yo > UINT32_MAX || uo > UINT32_MAX) return false;
+	*dma = (struct cdn_dmabuf){ f->width, f->height,
+		{ (int)y->fd, (uint32_t)yo, (uint32_t)f->stride_y },
+		{ (int)uv->fd, (uint32_t)uo, (uint32_t)f->stride_uv } };
+	return true;
+}
+
+static int temporal_process(struct cam *c, const struct cdn_frame *in,
+			    struct cdn_frame *out, const struct cdn_frame_info *info,
+			    float strength, const struct cdn_dmabuf *dma)
+{
+	const struct cdn_backend_dmabuf_ops *ext = cdn_backend_dmabuf(c->ops);
+	int rc = -ENOTSUP;
+	if (dma && ext && ext->process)
+		rc = ext->process(c->bstate, dma, out, info, strength);
+	if (rc == -ENOTSUP)
+		rc = c->ops->process(c->bstate, in, out, info, strength);
+	if (rc == -EAGAIN) return rc; // producer is not ready: drop without reading
+	if (rc && c->ops != cdn_cpu_backend()) {
+		fprintf(stderr, "camera-denoise: temporal %s failed (%d), using cpu\n", c->ops->name, rc);
+		c->ops->destroy(c->bstate);
+		c->ops = cdn_cpu_backend();
+		c->bstate = c->ops->create(in->width, in->height, c->app->cfg.threads);
+		rc = c->bstate ? c->ops->process(c->bstate, in, out, info, strength) : -ENOMEM;
+	}
+	return rc;
 }
 
 static void on_in_process(void *data)
@@ -292,19 +340,24 @@ static void on_in_process(void *data)
 		double t0 = mono_ms();
 		size_t need = (size_t)w * h * 3 / 2;
 
+		struct cdn_dmabuf dma, *dma_in = NULL;
+		const struct cdn_backend_dmabuf_ops *ext = cdn_backend_dmabuf(c->ops);
+		if (frame_dmabuf(ib->buffer, &fi, &dma)) dma_in = &dma;
+		bool cached_copy = !ext || !(ext->flags & CDN_BACKEND_SINGLE_UPLOAD);
 		/*
-		 * Every pass reads the input, so read the camera's buffer once,
+		 * Every CPU pass reads the input, so read the camera's buffer once,
 		 * sequentially, into cached memory first.
 		 */
-		if (c->copy_size < need) {
+		if (cached_copy && c->copy_size < need) {
 			free(c->copy);
 			c->copy = malloc(need);
 			c->copy_size = c->copy ? need : 0;
 		}
-		if (c->copy) {
+		if (cached_copy && c->copy) {
 			struct cdn_frame cf = { c->copy, c->copy + (size_t)w * h, w, h, w, w };
 			cdn_frame_copy(&fi, &cf);
 			fi = cf;
+			dma_in = NULL;
 		}
 		c->copy_ms += mono_ms() - t0;
 		if (boost && c->stage_size < need) {
@@ -316,14 +369,16 @@ static void on_in_process(void *data)
 			/* temporal result B, then the low-light stage blends a*M(B) over it */
 			struct cdn_frame sf = { c->stage, c->stage + (size_t)w * h, w, h, w, w };
 
-			if (c->ops->process(c->bstate, &fi, &sf, &info, 1.0f))
-				cdn_frame_copy(&fi, &sf);
+			int rc = temporal_process(c, &fi, &sf, &info, 1.0f, dma_in);
+			if (rc == -EAGAIN) goto drop_frame;
+			if (rc) cdn_frame_copy(&fi, &sf);
 			if (c->ml_ops->process(c->ml_state, &sf, &fo, &info, strength))
 				cdn_frame_copy(&sf, &fo);
 			c->boosted++;
-		} else if (c->ops->process(c->bstate, &fi, &fo, &info,
-					   temporal ? 1.0f : strength)) {
-			cdn_frame_copy(&fi, &fo);
+		} else {
+			int rc = temporal_process(c, &fi, &fo, &info, temporal ? 1.0f : strength, dma_in);
+			if (rc == -EAGAIN) goto drop_frame;
+			if (rc) cdn_frame_copy(&fi, &fo);
 		}
 		if (!boost && c->ml_state && c->ml_ops->reset)
 			c->ml_ops->reset(c->ml_state);
@@ -351,6 +406,11 @@ static void on_in_process(void *data)
 	pw_stream_queue_buffer(c->out, ob);
 	pw_stream_trigger_process(c->out);
 	log_stats(c, strength, gain, noise);
+	return;
+
+drop_frame:
+	pw_stream_queue_buffer(c->in, ib);
+	pw_stream_queue_buffer(c->out, ob);
 }
 
 static void on_in_state(void *data, enum pw_stream_state old, enum pw_stream_state state,
@@ -459,11 +519,16 @@ static void setup_backend(struct cam *c)
 	c->ml_ops = NULL;
 
 	if (cfg->temporal) {
-		/* the CPU temporal filter always, a plugin on top for low light */
-		c->ops = cdn_cpu_backend();
-		c->bstate = c->ops->create(w, h, cfg->threads);
+		/* Prefer GPU temporal; keep the low-light plugin independently gated.
+		 * --backend cpu is also an explicit CPU baseline for measurements. */
+		c->ops = !strcmp(cfg->backend, "cpu") ? cdn_cpu_backend() : cdn_backend_find("gpu", NULL);
+		if (c->ops) c->bstate = c->ops->create(w, h, cfg->threads);
+		if (!c->bstate) {
+			c->ops = cdn_cpu_backend();
+			c->bstate = c->ops->create(w, h, cfg->threads);
+		}
 		c->ml_ops = cdn_backend_find(cfg->backend, cfg->prefer);
-		if (c->ml_ops == cdn_cpu_backend())
+		if (c->ml_ops == cdn_cpu_backend() || c->ml_ops == cdn_backend_find("gpu", NULL))
 			c->ml_ops = NULL;
 		if (c->ml_ops)
 			c->ml_state = c->ml_ops->create(w, h, cfg->threads);
@@ -508,7 +573,9 @@ static void on_out_param_changed(void *data, uint32_t id, const struct spa_pod *
 	}
 	if (spa_format_parse(param, &mtype, &msub) < 0 || mtype != SPA_MEDIA_TYPE_video ||
 	    msub != SPA_MEDIA_SUBTYPE_raw || spa_format_video_raw_parse(param, &r) < 0 ||
-	    r.format != SPA_VIDEO_FORMAT_NV12 || !r.size.width || !r.size.height ||
+	    r.format != SPA_VIDEO_FORMAT_NV12 ||
+	    ((r.flags & SPA_VIDEO_FLAG_MODIFIER) && r.modifier != 0) ||
+	    !r.size.width || !r.size.height ||
 	    (r.size.width & 1) || (r.size.height & 1)) {
 		pw_stream_set_error(c->out, -EINVAL, "only even-sized NV12 is supported");
 		return;

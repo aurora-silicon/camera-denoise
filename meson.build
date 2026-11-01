@@ -28,6 +28,27 @@ core = static_library('cdn-core',
   dependencies : [threads, dl, m])
 core_dep = declare_dependency(link_with : core, dependencies : [threads, dl, m])
 
+vulkan = dependency('vulkan', version : '>= 1.1', required : get_option('gpu'))
+glslang = find_program('glslangValidator', required : get_option('gpu'))
+if vulkan.found() and glslang.found() and not get_option('gpu').disabled()
+  python = import('python').find_installation('python3')
+  spirv = []
+  foreach shader : ['filter', 'noise']
+    spirv += custom_target(shader + '-spirv',
+      input : 'src/gpu' / (shader + '.comp'), output : shader + '.spv',
+      depend_files : 'src/gpu/common.glsl',
+      command : [glslang, '-V', '--target-env', 'vulkan1.1', '-I' + meson.current_source_dir() / 'src/gpu',
+                 '-o', '@OUTPUT@', '@INPUT@'])
+  endforeach
+  shaders = custom_target('shaders', input : spirv, output : 'shaders.h',
+    command : [python, files('tools/embed-spirv.py'), '@OUTPUT@', '@INPUT@'])
+  gpu = shared_module('cdn-backend-gpu', 'src/gpu/denoise_gpu.c', shaders,
+    name_prefix : '', dependencies : [vulkan, m], install : true, install_dir : backenddir)
+  test_gpu = executable('test_gpu', 'tests/test_gpu.c', dependencies : core_dep)
+  test('gpu', test_gpu, args : [gpu.full_path()],
+    env : ['CDN_GPU_ALLOW_SOFTWARE=1'], timeout : 180)
+endif
+
 pipewire = dependency('libpipewire-0.3', version : '>= 1.0', required : get_option('daemon'))
 if pipewire.found()
   executable('aurora-camera-denoise', 'src/main.c',
@@ -36,6 +57,8 @@ endif
 
 executable('aurora-camera-denoise-bench', 'tools/cdn-bench.c',
   dependencies : core_dep, install : true)
+executable('aurora-camera-denoise-compare', 'tools/cdn-compare.c',
+  dependencies : m, install : true)
 executable('aurora-camera-denoise-metrics', 'tools/cdn-metrics.c',
   dependencies : m, install : true)
 

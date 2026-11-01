@@ -1,0 +1,105 @@
+// SPDX-License-Identifier: MIT
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+layout(local_size_x=128) in;
+layout(constant_id=0) const int PASS=0;
+
+int spatial(int base, int x, int y, int dist, bool chroma) {
+    int c=tmp[base+y*pc.w+x], tt=par[chroma ? 11 : 10];
+    int bo=chroma ? 2*dist : dist, height=chroma ? pc.h/2 : pc.h;
+    if (x<bo || x>=pc.w-bo || y<dist || y>=height-dist) return c;
+    if (!chroma) tt=max(mulq(tt,tmp[KY+y*pc.w+x]),(tt+3)>>2);
+    int sum=0;
+    for (int dy=-1;dy<=1;dy++) for(int dx=-1;dx<=1;dx++)
+        if(dx!=0 || dy!=0) sum+=clamp(tmp[base+(y+dy*dist)*pc.w+x+dx*bo]-c,-tt,tt);
+    return sat(c+mulq(sum,3641));
+}
+int median(int off) {
+    int a[144], n=0;
+    for(int i=0;i<144;i++) {
+        int v=par[MED+off+i];
+        if(v<0) continue;
+        int j=n;
+        while(j>0 && a[j-1]>v) { a[j]=a[j-1]; j--; }
+        a[j]=v; n++;
+    }
+    return n<4 ? 0 : a[n/2];
+}
+void scale(int range, int off) {
+    // Match the CPU's largest shift whose quotient fits 16 bits, without int64.
+    int sh=16;
+    uint num=uint(32767-4095)<<16;
+    while((num>>uint(16-sh))/uint(range)>65535u) sh--;
+    par[off]=int((num>>uint(16-sh))/uint(range)); par[off+1]=sh;
+}
+void main() {
+    int i=int(gl_GlobalInvocationID.x), x=i%pc.w, y=i/pc.w;
+    if(PASS==8) {
+        if(i!=0) return;
+        par[0]+=(median(0)-par[0])/4;
+        par[1]+=(median(144)-par[1])/4;
+        int med=max(par[0],8), mc=max(par[1],8);
+        par[2]=(med*320)>>8; par[3]=max((med*512)>>8,par[2]+1)-par[2];
+        scale(par[3],4);
+        par[6]=(med*416)>>8; par[7]=max((med*896)>>8,par[6]+1)-par[6];
+        scale(par[7],8);
+        par[10]=clamp((med*7+16)>>5,1,64);
+        par[11]=clamp((mc*21+32)>>6,1,64);
+        return;
+    }
+    if(PASS==0) {
+        if(i>=N) return;
+        hist[HY+i]=src(x,y,false)<<4; hist[AGE+i]=1;
+        if(i<N/2) hist[HC+i]=src(x,y,true)<<4;
+        // First frame is unfiltered. One invocation owns each output word.
+        if(i<(N+N/2+3)/4) {
+            uint v=0;
+            for(int k=0;k<4;k++) {
+                int j=4*i+k; bool c=j>=N; int p=c ? j-N : j;
+                if(j<N+N/2) v|=uint(src(p%pc.w,p/pc.w,c))<<(8*k);
+            }
+            dst[i]=v;
+        }
+        return;
+    }
+    if(PASS==1) {
+        if(i>=N) return;
+        int d=src(x,y,false)-sat((hist[HY+i]+8)>>4);
+        tmp[DIFF+i]=abs(d) | ((clamp(d,-128,127)&65535)<<16);
+    } else if(PASS==2) {
+        if(i>=N) return;
+        int sum=0;
+        for(int dx=-2;dx<=2;dx++) sum+=tmp[DIFF+at(x+dx,y)]>>16;
+        tmp[HS+i]=sum;
+    } else if(PASS==3) {
+        if(i>=N) return;
+        int m=0,a=0;
+        for(int dy=-1;dy<=1;dy++) for(int dx=-1;dx<=1;dx++) m+=tmp[DIFF+at(x+dx,y+dy)]&65535;
+        for(int dy=-2;dy<=2;dy++) a+=tmp[HS+at(x,y+dy)];
+        int km=4095+max(ramp(m,par[2],par[3],par[4],par[5]),ramp(abs(a),par[6],par[7],par[8],par[9]));
+        int ag=hist[AGE+i], kk=max(km,32767/(ag+1));
+        hist[AGE+i]=km>16383 ? 1 : min(ag+1,7);
+        int nh=hist[HY+i]+mulq((src(x,y,false)<<4)-hist[HY+i],kk);
+        hist[HY+i]=nh; tmp[KY+i]=kk; tmp[TY+i]=sat((nh+8)>>4);
+    } else if(PASS==4) {
+        if(i>=N/2) return;
+        int p=(2*y)*pc.w+(x&~1);
+        int kk=max(max(tmp[KY+p],tmp[KY+p+1]),max(tmp[KY+p+pc.w],tmp[KY+p+pc.w+1]));
+        int nh=hist[HC+i]+mulq((src(x,y,true)<<4)-hist[HC+i],kk);
+        hist[HC+i]=nh; tmp[TC+i]=sat((nh+8)>>4);
+    } else if(PASS==5 || PASS==7) {
+        bool c=PASS==7; int size=c ? N/2 : N;
+        if(i>=(size+3)/4) return;
+        // Pack four bytes without byte-store races, including widths == 2 mod 4.
+        uint v=0;
+        for(int k=0;k<4;k++) {
+            int j=4*i+k, xx=j%pc.w, yy=j/pc.w;
+            if(j<size) v|=uint(blend(src(xx,yy,c),spatial(c?TC2:TY,xx,yy,c?2:1,c)))<<(8*k);
+        }
+        dst[(c?N/4:0)+i]=v;
+    } else if(PASS==6) {
+        if(i>=N/2) return;
+        tmp[TC2+i]=spatial(TC,x,y,1,true);
+    }
+}

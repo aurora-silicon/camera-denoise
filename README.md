@@ -6,7 +6,7 @@ It runs as a user service. For each built-in camera (the `apple-isp` V4L2 driver
 
 ## When it filters
 
-The temporal filter runs on every frame of every stream, as macOS runs its motion-compensated temporal filter on every camera stream. It's what makes the macOS camera look clean in a normal room. Measured on the MacBook Pro 16-inch M4 Pro, same scene, on a flat part of the picture: luma noise 13.6 straight from the camera, 2.4 through this filter and 2.1 on macOS (8-bit code values).
+The temporal filter runs on every frame of every stream, on Vulkan compute when the GPU plugin works and on CPU otherwise, as macOS runs its motion-compensated temporal filter on every camera stream. It's what makes the macOS camera look clean in a normal room. Measured on the MacBook Pro 16-inch M4 Pro, same scene, on a flat part of the picture: luma noise 13.6 straight from the camera, 2.4 through this filter and 2.1 on macOS (8-bit code values).
 
 A low-light stage joins in on top when a backend plugin such as the Neural Engine one is installed, like macOS' machine-learning noise reduction. In `auto` mode it follows two signals, each with its own on and off level so it does not flicker:
 
@@ -30,12 +30,14 @@ Copy `/usr/share/aurora-camera-denoise/examples/denoise.conf` to `~/.config/auro
 
 - `mode = auto | on | off`, where `off` passes every frame through unchanged
 - `temporal = on | off`. With `off` the filter works as it did before: nothing runs below the levels, and above them the one backend (Neural Engine or CPU) does all the work
-- `backend = auto | cpu`, where `auto` uses the Neural Engine backend when one is installed and works, else the CPU
+- `backend = auto | cpu`, where `auto` prefers GPU for the temporal stage and uses the Neural Engine backend for low light when installed and working; `cpu` forces CPU for measurements
 - any board level, e.g. `enter-gain = 1536`, or `enter-noise = 0` to follow the gain only
 
 To turn it off completely, `systemctl --user mask --now aurora-camera-denoise`. The distro packages enable it for every user through a preset, so `disable` alone does not stick.
 
-## How the CPU backend works
+The optional [Vulkan backend](docs/gpu-backend.md) implements the same filter, including noise estimation, on the GPU. It imports linear camera DMA-BUFs when supported and otherwise uploads once. Build with `-Dgpu=enabled` to require it.
+
+## How the filter works
 
 Each pixel keeps a short history. A motion test compares the new frame against it twice: the 3x3 sum of absolute differences catches textured motion, and the 5x5 sum of signed differences catches a dark subject moving over a dark background, where the noise cancels but the change adds up. Still pixels average about 15 frames, moving ones restart a running mean (1/2, 1/3, ...) so nothing leaves a trail. An edge-preserving 3x3 filter then smooths what the temporal filter could not, mostly moving areas, and chroma gets two wider passes since low-light colour noise is blotchy. All thresholds scale with the noise measured on the still parts of the frame.
 
@@ -47,7 +49,8 @@ The filter calls a small backend interface (`src/backend.h`). The CPU backend is
 
 ## Tools
 
-- `aurora-camera-denoise-bench W H frames.nv12` runs a backend over raw NV12 frames and reports latency and CPU time
+- `aurora-camera-denoise-bench W H frames.nv12` runs a backend over raw NV12 frames and reports latency and CPU time (`-b gpu`, `-r 30` for paced timing)
+- `aurora-camera-denoise-compare W H cpu.nv12 gpu.nv12` checks paired output PSNR against CPU, with a 40 dB minimum for every frame and plane
 - `aurora-camera-denoise-metrics W H reference.nv12 test.nv12` reports temporal noise, PSNR and SSIM against the average of a long static capture
 
 ## Building
