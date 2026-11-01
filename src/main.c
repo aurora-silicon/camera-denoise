@@ -470,9 +470,24 @@ static void setup_backend(struct cam *c)
 	c->ml_ops = NULL;
 
 	if (cfg->temporal) {
-		/* the CPU temporal filter always, a plugin on top for low light */
-		c->ops = cdn_cpu_backend();
-		c->bstate = c->ops->create(w, h, cfg->threads);
+		/*
+		 * The temporal filter on every frame: the encoder's motion-
+		 * compensated filter when the driver offers it, as on macOS,
+		 * else the CPU. A plugin on top for low light.
+		 */
+		bool tauto = !strcmp(cfg->temporal_backend, "auto");
+
+		c->ops = cdn_backend_find(tauto ? "auto" : cfg->temporal_backend,
+					  tauto ? "ave" : NULL);
+		if (c->ops)
+			c->bstate = c->ops->create(w, h, cfg->threads);
+		if (!c->bstate && c->ops != cdn_cpu_backend()) {
+			if (!tauto)
+				fprintf(stderr, "camera-denoise: temporal backend %s unavailable "
+					"for %dx%d, using cpu\n", cfg->temporal_backend, w, h);
+			c->ops = cdn_cpu_backend();
+			c->bstate = c->ops->create(w, h, cfg->threads);
+		}
 		c->ml_ops = cdn_backend_find(cfg->backend, cfg->prefer);
 		if (c->ml_ops == cdn_cpu_backend())
 			c->ml_ops = NULL;
