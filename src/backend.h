@@ -16,6 +16,7 @@
 #define CDN_BACKEND_H
 
 #include <stdint.h>
+#include <stddef.h>
 
 #define CDN_BACKEND_ABI 1
 #define CDN_BACKEND_ENTRY "cdn_backend_entry"
@@ -67,6 +68,34 @@ struct cdn_backend_ops {
 };
 
 typedef const struct cdn_backend_ops *(*cdn_backend_entry_fn)(void);
+
+/* Optional ABI v1 companion symbol; the original ops/frame layouts stay intact.
+ * Borrowed, linear NV12 DMA-BUFs; offsets are from the start of each fd,
+ * including the PipeWire mapoffset and chunk offset. The caller owns the
+ * buffers until this synchronous call returns. No explicit-sync streams.
+ */
+#define CDN_DMABUF_ENTRY "cdn_backend_dmabuf_entry"
+#define CDN_DMABUF_ABI 1
+#define CDN_BACKEND_SINGLE_UPLOAD 1u
+struct cdn_dmabuf_plane {
+	int fd;
+	uint32_t offset, stride;
+};
+struct cdn_dmabuf {
+	int width, height;
+	struct cdn_dmabuf_plane y, uv;
+};
+struct cdn_backend_dmabuf_ops {
+	uint32_t abi, flags;
+	/* -ENOTSUP means retry the ordinary process path, without resetting
+	 * history. -EAGAIN means the producer fence is not ready: drop the frame
+	 * without reading it. Other errors permit CPU fallback. */
+	int (*process)(void *state, const struct cdn_dmabuf *in,
+		       struct cdn_frame *out, const struct cdn_frame_info *info,
+		       float strength);
+};
+typedef const struct cdn_backend_dmabuf_ops *(*cdn_backend_dmabuf_entry_fn)(void);
+const struct cdn_backend_dmabuf_ops *cdn_backend_dmabuf(const struct cdn_backend_ops *ops);
 
 /* The built-in CPU backend (temporal + spatial, NEON on arm64). */
 const struct cdn_backend_ops *cdn_cpu_backend(void);

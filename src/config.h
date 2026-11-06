@@ -20,6 +20,12 @@ struct cdn_config {
 	 * as macOS does (MinFrameRateOverride 15), instead of raising the gain.
 	 */
 	bool low_light_frame_rate;
+	/*
+	 * The temporal stage: auto, cpu or gpu. auto is the CPU for now. On the
+	 * Neo the Vulkan path costs about 3.3x the CPU path's energy, so the GPU
+	 * stays opt-in until it is cheaper.
+	 */
+	char temporal_backend[16];
 	char backend[32];	/* auto, cpu or a plugin name */
 	char prefer[64];	/* plugins "auto" tries before cpu */
 	int threads;		/* 0: backend default */
@@ -36,6 +42,9 @@ struct cdn_config {
 int cdn_config_load(struct cdn_config *c, const char *compat_path,
 		    const char *boards_path, const char *const *settings,
 		    int nsettings);
+
+/* The plugin the temporal stage runs on: "cpu" or "gpu" */
+const char *cdn_temporal_backend(const struct cdn_config *c);
 
 void cdn_config_print(const struct cdn_config *c);
 

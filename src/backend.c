@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 #include <dlfcn.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "backend.h"
@@ -19,16 +20,44 @@ void cdn_frame_copy(const struct cdn_frame *in, struct cdn_frame *out)
 		       in->uv + (size_t)y * in->stride_uv, (size_t)in->width);
 }
 
+/* Plugins are loaded on the main thread before streaming. Cache successful
+ * loads so renegotiation does not leak handles. Retry failures on reload,
+ * allowing a newly installed plugin to become available without a restart. */
+static struct plugin {
+	char name[65];
+	const struct cdn_backend_ops *ops;
+	const struct cdn_backend_dmabuf_ops *dmabuf;
+} plugins[32];
+static unsigned nplugins;
+
+const struct cdn_backend_dmabuf_ops *cdn_backend_dmabuf(const struct cdn_backend_ops *ops)
+{
+	for (unsigned i = 0; i < nplugins; i++)
+		if (plugins[i].ops == ops)
+			return plugins[i].dmabuf;
+	return NULL;
+}
+
 static const struct cdn_backend_ops *load_plugin(const char *name)
 {
 	char path[512];
 	void *dl;
 	cdn_backend_entry_fn entry;
+	cdn_backend_dmabuf_entry_fn dmabuf_entry;
+	struct plugin *p;
 	const struct cdn_backend_ops *ops;
 
 	if (strchr(name, '/') || strlen(name) > 64)
 		return NULL;
-	snprintf(path, sizeof(path), "%s/cdn-backend-%s.so", CDN_BACKEND_DIR, name);
+	for (unsigned i = 0; i < nplugins; i++)
+		if (!strcmp(plugins[i].name, name))
+			return plugins[i].ops;
+	if (nplugins == sizeof(plugins) / sizeof(plugins[0]))
+		return NULL;
+	const char *dir = getenv("CDN_BACKEND_DIR");
+	if (!dir || !*dir) dir = CDN_BACKEND_DIR;
+	if (snprintf(path, sizeof(path), "%s/cdn-backend-%s.so", dir, name) >= (int)sizeof(path))
+		return NULL;
 	dl = dlopen(path, RTLD_NOW | RTLD_LOCAL);
 	if (!dl)
 		return NULL;
@@ -41,6 +70,13 @@ static const struct cdn_backend_ops *load_plugin(const char *name)
 		dlclose(dl);
 		return NULL;
 	}
+	p = &plugins[nplugins++];
+	snprintf(p->name, sizeof(p->name), "%s", name);
+	p->ops = ops;
+	dmabuf_entry = (cdn_backend_dmabuf_entry_fn)dlsym(dl, CDN_DMABUF_ENTRY);
+	p->dmabuf = dmabuf_entry ? dmabuf_entry() : NULL;
+	if (p->dmabuf && p->dmabuf->abi != CDN_DMABUF_ABI)
+		p->dmabuf = NULL;
 	/* stays loaded for the life of the process */
 	return ops;
 }

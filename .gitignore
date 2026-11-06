@@ -1,2 +1,3 @@
 build/
 *.nv12
+__pycache__/
