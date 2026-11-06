@@ -26,7 +26,7 @@ int main(int argc, char **argv)
 	      "[apple,j700]\nenter-gain = 2304  # Neo\nexit-gain = 1792\nramp-down-frames = 30\n", f);
 	fclose(f);
 	f = fopen(user, "w");
-	fputs("[denoise]\nmode = on\nbackend = cpu\nexit-gain = 1500\n", f);
+	fputs("[denoise]\nmode = on\nbackend = cpu\nexit-gain = 1500\ntemporal = off\nlow-light-frame-rate = off\n", f);
 	fclose(f);
 	f = fopen(bad, "w");
 	fputs("[denoise]\nmode = sometimes\n", f);
@@ -37,10 +37,21 @@ int main(int argc, char **argv)
 	CHECK(c.trig.enter_gain == 2304 && c.trig.exit_gain == 1792);
 	CHECK(!c.framing.supported);
 	CHECK(c.mode == CDN_MODE_AUTO && !strcmp(c.backend, "auto"));
+	CHECK(c.temporal);
+	CHECK(c.low_light_frame_rate);
+	/* the GPU temporal path costs more energy than the CPU one: opt-in only */
+	CHECK(!strcmp(c.temporal_backend, "auto"));
+	CHECK(!strcmp(cdn_temporal_backend(&c), "cpu"));
+	snprintf(c.temporal_backend, sizeof(c.temporal_backend), "gpu");
+	CHECK(!strcmp(cdn_temporal_backend(&c), "gpu"));
+	snprintf(c.backend, sizeof(c.backend), "cpu");
+	CHECK(!strcmp(cdn_temporal_backend(&c), "cpu"));
 
 	const char *s1[] = { "/nonexistent", user };
 	CHECK(cdn_config_load(&c, compat, boards, s1, 2) == 0);
 	CHECK(c.mode == CDN_MODE_ON && !strcmp(c.backend, "cpu"));
+	CHECK(!c.temporal);
+	CHECK(!c.low_light_frame_rate);
 	CHECK(c.trig.enter_gain == 2304 && c.trig.exit_gain == 1500);
 
 	/* Digital framing is a user opt-in, not a packaged board capability. */
@@ -54,12 +65,22 @@ int main(int argc, char **argv)
 	f = fopen(user, "a"); fputs("framing-zoom-default = 7\n", f); fclose(f);
 	CHECK(cdn_config_load(&c, compat, boards, s1, 2) != 0);
 
+	f = fopen(user, "w");
+	fputs("[denoise]\ntemporal-backend = gpu\n", f);
+	fclose(f);
+	CHECK(cdn_config_load(&c, compat, boards, s1, 2) == 0);
+	CHECK(!strcmp(cdn_temporal_backend(&c), "gpu") && !strcmp(c.backend, "auto"));
+	f = fopen(user, "w");
+	fputs("[denoise]\ntemporal-backend = vulkan\n", f);
+	fclose(f);
+	CHECK(cdn_config_load(&c, compat, boards, s1, 2) != 0);
+
 	const char *s2[] = { bad };
 	CHECK(cdn_config_load(&c, compat, boards, s2, 1) != 0);
 
-	/* unknown board: no thresholds, so auto never turns on */
+	/* unknown board: no thresholds, so only the temporal filter runs */
 	CHECK(cdn_config_load(&c, "/nonexistent", boards, NULL, 0) == 0);
-	CHECK(c.board[0] == 0 && c.trig.enter_gain == 0);
+	CHECK(c.board[0] == 0 && c.trig.enter_gain == 0 && c.temporal);
 
     f = fopen(boards, "a");
     fputs("framing-supported = true\nframing-zoom-min = 1\nframing-zoom-max = 6\nframing-zoom-default = 1.5\n", f);

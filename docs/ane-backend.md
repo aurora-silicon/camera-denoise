@@ -12,7 +12,7 @@ The filter does not know how a frame gets denoised. It hands each NV12 frame to 
     void  destroy(void *state);
 
 - `create` returns NULL when the backend cannot run here (no device, no permission, size outside the compiled model). The filter then uses the CPU backend, so a missing or busy Neural Engine never breaks the camera.
-- `process` gets an NV12 frame in cached memory and writes the result to `out`. `strength` (0 to 1) is the trigger's fade, apply it as `in + strength * (denoised - in)`. `info` carries the sensor gain and exposure of the frame, which a model can take as a noise level input.
+- `process` gets an NV12 frame in cached memory and writes the result to `out`. With `temporal = on` (the default) that input is already the temporal filter's output, so the model refines a cleaner frame. `strength` (0 to 1) is the trigger's fade, apply it as `in + strength * (denoised - in)`. `info` carries the sensor gain and exposure of the frame, which a model can take as a noise level input.
 - `reset` drops temporal state, called when the filter passes frames through or the stream restarts.
 - `noise_sigma` is optional, for logging.
 

@@ -2,3 +2,5 @@ option('daemon', type : 'feature', value : 'auto',
   description : 'Build the PipeWire filter (needs libpipewire-0.3)')
 option('systemduserunitdir', type : 'string', value : '',
   description : 'Where to install the systemd user unit (default: from systemd.pc)')
+option('gpu', type : 'feature', value : 'auto',
+  description : 'Build the Vulkan compute backend (Vulkan 1.1 and glslangValidator)')

@@ -5,12 +5,17 @@
  * For every PipeWire camera source whose V4L2 driver is listed in the
  * config (apple-isp by default), publish a Video/Source node with the same
  * formats (NV12). When a client streams from it, connect to the camera,
- * denoise each frame (when the trigger says so) and pass it on. With no
- * client, the camera is not touched.
+ * denoise each frame and pass it on. With no client, the camera is not
+ * touched.
  *
- * The trigger follows the sensor gain the driver reports per frame, with
- * per-board enter/exit thresholds and a ramp, like macOS' automatic ML
- * video noise reduction. Below the threshold frames are copied unchanged.
+ * Like macOS, two stages. The temporal filter runs on every frame, as
+ * macOS runs its motion-compensated temporal filter on every camera
+ * stream. A low-light stage (a backend plugin such as the Neural Engine
+ * one) joins in when the trigger says so: it follows the sensor gain the
+ * driver reports per frame, with per-board enter/exit thresholds and a
+ * ramp, like macOS' automatic ML video noise reduction. With temporal =
+ * off the trigger gates the one backend instead, and frames below the
+ * threshold are copied unchanged.
  */
 #include <errno.h>
 #include <getopt.h>
@@ -34,6 +39,7 @@
 #include "config.h"
 #include "gain.h"
 #include "effects.h"
+#include "pipewire-frame.h"
 #include "trigger.h"
 
 #ifndef CDN_DATADIR
@@ -73,15 +79,28 @@ struct cam {
 	struct pw_stream *in;
 	struct spa_hook in_listener;
 	bool out_streaming;
+	/*
+	 * The camera can be busy (another program holds it) or fail when a
+	 * client starts. Then retry the input with a backoff for as long as
+	 * a client is waiting, instead of leaving the client with no frames.
+	 */
+	struct spa_source *retry;
+	int retry_ms;
 
 	struct spa_video_info_raw fmt; /* negotiated on out */
 	bool have_fmt;
 	int out_stride;
 
+	/* the temporal stage, or with temporal = off the gated backend */
 	const struct cdn_backend_ops *ops;
 	void *bstate;
 	struct cdn_effects *effects;
 	struct ce_config effect_cfg;
+	/* the low-light stage on top of the temporal one, if a plugin runs */
+	const struct cdn_backend_ops *ml_ops;
+	void *ml_state;
+	uint8_t *stage;
+	size_t stage_size;
 	struct cdn_trigger trig;
 	struct cdn_gain gain;
 	bool gain_tried;
@@ -95,7 +114,7 @@ struct cam {
 	size_t copy_size;
 
 	/* stats */
-	uint64_t frames, denoised;
+	uint64_t frames, denoised, boosted;
 	double busy_ms, copy_ms;
 	uint64_t last_pts;
 	float fps_meas;
@@ -111,7 +130,7 @@ struct app {
 	struct spa_hook registry_listener;
 	struct spa_list cams;
 	struct cdn_config cfg;
-	const char *cli_mode, *cli_backend, *cli_config;
+	const char *cli_mode, *cli_backend, *cli_config, *cli_temporal_backend;
 	const char *boards_path;
 	const char *stream_name;
 	bool verbose;
@@ -154,6 +173,14 @@ static int load_config(struct app *a)
 	}
 	if (a->cli_backend)
 		snprintf(next.backend, sizeof(next.backend), "%s", a->cli_backend);
+	if (a->cli_temporal_backend) {
+		const char *t = a->cli_temporal_backend;
+		if (strcmp(t, "auto") && strcmp(t, "cpu") && strcmp(t, "gpu")) {
+			fprintf(stderr, "camera-denoise: bad --temporal-backend %s\n", t);
+			return -1;
+		}
+		snprintf(next.temporal_backend, sizeof(next.temporal_backend), "%s", t);
+	}
 	a->cfg = next;
 	cdn_config_print(&a->cfg);
 	return 0;
@@ -175,34 +202,6 @@ static bool driver_listed(const struct app *a, const char *drv)
 /* ---------------------------------------------------------------------- */
 /* frame plumbing                                                          */
 
-static bool frame_from_buffer(struct spa_buffer *b, const struct spa_video_info_raw *f,
-			      struct cdn_frame *fr)
-{
-	struct spa_data *d = &b->datas[0];
-	int w = (int)f->size.width, h = (int)f->size.height;
-
-	if (!d->data || !d->chunk)
-		return false;
-	fr->width = w;
-	fr->height = h;
-	fr->stride_y = d->chunk->stride > 0 ? d->chunk->stride : w;
-	fr->y = (uint8_t *)d->data + d->chunk->offset;
-	if (b->n_datas >= 2 && b->datas[1].data && b->datas[1].chunk) {
-		struct spa_data *u = &b->datas[1];
-		fr->uv = (uint8_t *)u->data + u->chunk->offset;
-		fr->stride_uv = u->chunk->stride > 0 ? u->chunk->stride : fr->stride_y;
-	} else {
-		size_t need = (size_t)fr->stride_y * h * 3 / 2;
-		if (d->chunk->size && d->chunk->size < need)
-			return false;
-		if (d->maxsize < d->chunk->offset + need)
-			return false;
-		fr->uv = fr->y + (size_t)fr->stride_y * h;
-		fr->stride_uv = fr->stride_y;
-	}
-	return true;
-}
-
 static void log_stats(struct cam *c, float strength, uint32_t gain, float noise)
 {
 	time_t now = time(NULL);
@@ -211,10 +210,11 @@ static void log_stats(struct cam *c, float strength, uint32_t gain, float noise)
 		return;
 	c->last_log = now;
 	fprintf(stderr,
-		"camera-denoise: %s: %llu frames, %llu denoised, %.2f ms per denoised frame "
-		"(%.2f ms of it copying), gain %u, noise %.2f, fps %.1f, strength %.2f\n",
+		"camera-denoise: %s: %llu frames, %llu denoised, %llu low-light, %.2f ms per "
+		"denoised frame (%.2f ms of it copying), gain %u, noise %.2f, fps %.1f, "
+		"low-light strength %.2f\n",
 		c->src_nick, (unsigned long long)c->frames, (unsigned long long)c->denoised,
-		c->denoised ? c->busy_ms / c->denoised : 0.0,
+		(unsigned long long)c->boosted, c->denoised ? c->busy_ms / c->denoised : 0.0,
 		c->denoised ? c->copy_ms / c->denoised : 0.0, gain, noise, c->fps_meas, strength);
 }
 
@@ -328,6 +328,27 @@ static int set_effect_props(struct cam *c, const struct spa_pod *param)
 	return 0;
 }
 
+static int temporal_process(struct cam *c, const struct cdn_frame *in,
+			    struct cdn_frame *out, const struct cdn_frame_info *info,
+			    float strength, const struct cdn_dmabuf *dma)
+{
+	const struct cdn_backend_dmabuf_ops *ext = cdn_backend_dmabuf(c->ops);
+	int rc = -ENOTSUP;
+	if (dma && ext && ext->process)
+		rc = ext->process(c->bstate, dma, out, info, strength);
+	if (rc == -ENOTSUP)
+		rc = c->ops->process(c->bstate, in, out, info, strength);
+	if (rc == -EAGAIN) return rc; // producer is not ready: drop without reading
+	if (rc && c->ops != cdn_cpu_backend()) {
+		fprintf(stderr, "camera-denoise: temporal %s failed (%d), using cpu\n", c->ops->name, rc);
+		c->ops->destroy(c->bstate);
+		c->ops = cdn_cpu_backend();
+		c->bstate = c->ops->create(in->width, in->height, c->app->cfg.threads);
+		rc = c->bstate ? c->ops->process(c->bstate, in, out, info, strength) : -ENOMEM;
+	}
+	return rc;
+}
+
 static void on_in_process(void *data)
 {
 	struct cam *c = data;
@@ -355,7 +376,7 @@ static void on_in_process(void *data)
 	h = (int)c->fmt.size.height;
 
 	struct spa_data *od = &ob->buffer->datas[0];
-	if (!frame_from_buffer(ib->buffer, &c->fmt, &fi) || !od->data ||
+	if (!cdn_frame_from_buffer(ib->buffer, &c->fmt, &fi) || !od->data ||
 	    od->maxsize < (uint32_t)c->out_stride * h * 3 / 2) {
 		pw_stream_queue_buffer(c->in, ib);
 		pw_stream_return_buffer(c->out, ob);
@@ -391,28 +412,56 @@ static void on_in_process(void *data)
 	strength = cdn_trigger_step(&c->trig, gain, noise, fps);
 	c->frames++;
 
-	if (strength > 0 && c->bstate) {
+	bool temporal = c->app->cfg.temporal && c->app->cfg.mode != CDN_MODE_OFF;
+
+	if ((temporal || strength > 0) && c->bstate) {
 		struct cdn_frame_info info = { gain, exposure, ih ? (uint64_t)ih->pts : 0 };
+		bool boost = temporal && c->ml_state && strength > 0;
 		double t0 = mono_ms();
 		size_t need = (size_t)w * h * 3 / 2;
 
+		struct cdn_dmabuf dma, *dma_in = NULL;
+		const struct cdn_backend_dmabuf_ops *ext = cdn_backend_dmabuf(c->ops);
+		if (cdn_frame_dmabuf(ib->buffer, &fi, &dma)) dma_in = &dma;
+		bool cached_copy = !ext || !(ext->flags & CDN_BACKEND_SINGLE_UPLOAD);
 		/*
-		 * Every pass reads the input, so read the camera's buffer once,
+		 * Every CPU pass reads the input, so read the camera's buffer once,
 		 * sequentially, into cached memory first.
 		 */
-		if (c->copy_size < need) {
+		if (cached_copy && c->copy_size < need) {
 			free(c->copy);
 			c->copy = malloc(need);
 			c->copy_size = c->copy ? need : 0;
 		}
-		if (c->copy) {
+		if (cached_copy && c->copy) {
 			struct cdn_frame cf = { c->copy, c->copy + (size_t)w * h, w, h, w, w };
 			cdn_frame_copy(&fi, &cf);
 			fi = cf;
+			dma_in = NULL;
 		}
 		c->copy_ms += mono_ms() - t0;
-		if (c->ops->process(c->bstate, &fi, &fo, &info, strength))
-			cdn_frame_copy(&fi, &fo);
+		if (boost && c->stage_size < need) {
+			free(c->stage);
+			c->stage = malloc(need);
+			c->stage_size = c->stage ? need : 0;
+		}
+		if (boost && c->stage) {
+			/* temporal result B, then the low-light stage blends a*M(B) over it */
+			struct cdn_frame sf = { c->stage, c->stage + (size_t)w * h, w, h, w, w };
+
+			int rc = temporal_process(c, &fi, &sf, &info, 1.0f, dma_in);
+			if (rc == -EAGAIN) goto drop_frame;
+			if (rc) cdn_frame_copy(&fi, &sf);
+			if (c->ml_ops->process(c->ml_state, &sf, &fo, &info, strength))
+				cdn_frame_copy(&sf, &fo);
+			c->boosted++;
+		} else {
+			int rc = temporal_process(c, &fi, &fo, &info, temporal ? 1.0f : strength, dma_in);
+			if (rc == -EAGAIN) goto drop_frame;
+			if (rc) cdn_frame_copy(&fi, &fo);
+		}
+		if (!boost && c->ml_state && c->ml_ops->reset)
+			c->ml_ops->reset(c->ml_state);
 		c->busy_ms += mono_ms() - t0;
 		c->denoised++;
 	} else {
@@ -458,6 +507,52 @@ static void on_in_process(void *data)
 		pw_stream_return_buffer(c->out, ob);
 	}
 	log_stats(c, strength, gain, noise);
+	return;
+
+drop_frame:
+	pw_stream_queue_buffer(c->in, ib);
+	pw_stream_return_buffer(c->out, ob);
+}
+
+static int cam_start_input(struct cam *c);
+static void cam_stop_input(struct cam *c);
+
+#define RETRY_FIRST_MS 250
+#define RETRY_MAX_MS 2000
+
+static void on_retry(void *data, uint64_t expirations)
+{
+	struct cam *c = data;
+
+	(void)expirations;
+	cam_stop_input(c);
+	if (c->out_streaming && cam_start_input(c) < 0)
+		fprintf(stderr, "camera-denoise: %s: cannot restart the input\n", c->src_nick);
+}
+
+static void schedule_retry(struct cam *c)
+{
+	struct pw_loop *l = pw_main_loop_get_loop(c->app->loop);
+	struct timespec ts;
+
+	if (!c->retry)
+		c->retry = pw_loop_add_timer(l, on_retry, c);
+	if (!c->retry)
+		return;
+	c->retry_ms = c->retry_ms ? c->retry_ms * 2 : RETRY_FIRST_MS;
+	if (c->retry_ms > RETRY_MAX_MS)
+		c->retry_ms = RETRY_MAX_MS;
+	ts.tv_sec = c->retry_ms / 1000;
+	ts.tv_nsec = (long)(c->retry_ms % 1000) * 1000000L;
+	pw_loop_update_timer(l, c->retry, &ts, NULL, false);
+}
+
+static void cancel_retry(struct cam *c)
+{
+	if (c->retry)
+		pw_loop_update_timer(pw_main_loop_get_loop(c->app->loop), c->retry,
+				     NULL, NULL, false);
+	c->retry_ms = 0;
 }
 
 static void on_in_state(void *data, enum pw_stream_state old, enum pw_stream_state state,
@@ -468,6 +563,16 @@ static void on_in_state(void *data, enum pw_stream_state old, enum pw_stream_sta
 	if (c->app->verbose || state == PW_STREAM_STATE_ERROR)
 		fprintf(stderr, "camera-denoise: %s: input %s%s%s\n", c->src_nick,
 			pw_stream_state_as_string(state), error ? ": " : "", error ? error : "");
+	if (state == PW_STREAM_STATE_ERROR && c->out_streaming) {
+		/* the stream can't be destroyed from its own callback: use the timer */
+		if (!c->retry_ms)
+			fprintf(stderr, "camera-denoise: %s: camera unavailable, retrying while "
+				"a client waits\n", c->src_nick);
+		schedule_retry(c);
+	} else if (state == PW_STREAM_STATE_STREAMING && c->retry_ms) {
+		fprintf(stderr, "camera-denoise: %s: camera available again\n", c->src_nick);
+		c->retry_ms = 0;
+	}
 	(void)old;
 }
 
@@ -527,6 +632,17 @@ static int cam_start_input(struct cam *c)
 
 	r.format = SPA_VIDEO_FORMAT_NV12;
 	params[0] = spa_format_video_raw_build(&b, SPA_PARAM_EnumFormat, &r);
+	/*
+	 * Before the camera streams: may it slow down in low light? A camera
+	 * that is already streaming for another client keeps its setting.
+	 */
+	if (c->v4l2_path[0]) {
+		int err = cdn_v4l2_set_exposure_priority(c->v4l2_path,
+							 c->app->cfg.low_light_frame_rate);
+		if (err && err != -ENOTTY)
+			fprintf(stderr, "camera-denoise: %s: low-light frame rate not set: %s\n",
+				c->src_nick, strerror(-err));
+	}
 	c->last_pts = 0;
 	c->fps_meas = 0;
 	return pw_stream_connect(c->in, PW_DIRECTION_INPUT, PW_ID_ANY,
@@ -548,6 +664,8 @@ static void cam_stop_input(struct cam *c)
 	cdn_noise_tracker_reset(&c->noise);
 	if (c->bstate && c->ops->reset)
 		c->ops->reset(c->bstate);
+	if (c->ml_state && c->ml_ops->reset)
+		c->ml_ops->reset(c->ml_state);
 }
 
 /* ---------------------------------------------------------------------- */
@@ -561,6 +679,35 @@ static void setup_backend(struct cam *c)
 	if (c->bstate)
 		c->ops->destroy(c->bstate);
 	c->bstate = NULL;
+	if (c->ml_state)
+		c->ml_ops->destroy(c->ml_state);
+	c->ml_state = NULL;
+	c->ml_ops = NULL;
+
+	if (cfg->temporal) {
+		/* CPU temporal unless the GPU is asked for, with the low-light
+		 * plugin gated on its own. */
+		c->ops = cdn_backend_find(cdn_temporal_backend(cfg), NULL);
+		if (c->ops) c->bstate = c->ops->create(w, h, cfg->threads);
+		if (!c->bstate) {
+			c->ops = cdn_cpu_backend();
+			c->bstate = c->ops->create(w, h, cfg->threads);
+		}
+		c->ml_ops = cdn_backend_find(cfg->backend, cfg->prefer);
+		if (c->ml_ops == cdn_cpu_backend() || c->ml_ops == cdn_backend_find("gpu", NULL))
+			c->ml_ops = NULL;
+		if (c->ml_ops)
+			c->ml_state = c->ml_ops->create(w, h, cfg->threads);
+		if (c->ml_ops && !c->ml_state)
+			fprintf(stderr, "camera-denoise: backend %s unavailable for %dx%d, "
+				"temporal filter only\n", c->ml_ops->name, w, h);
+		fprintf(stderr, "camera-denoise: %s: %dx%d@%u/%u, temporal %s, low light %s\n",
+			c->src_nick, w, h, c->fmt.framerate.num, c->fmt.framerate.denom,
+			c->bstate ? c->ops->name : "none",
+			c->ml_state ? c->ml_ops->name : "none");
+		return;
+	}
+
 	c->ops = cdn_backend_find(cfg->backend, cfg->prefer);
 	if (c->ops)
 		c->bstate = c->ops->create(w, h, cfg->threads);
@@ -600,7 +747,9 @@ static void on_out_param_changed(void *data, uint32_t id, const struct spa_pod *
 	}
 	if (spa_format_parse(param, &mtype, &msub) < 0 || mtype != SPA_MEDIA_TYPE_video ||
 	    msub != SPA_MEDIA_SUBTYPE_raw || spa_format_video_raw_parse(param, &r) < 0 ||
-	    r.format != SPA_VIDEO_FORMAT_NV12 || !r.size.width || !r.size.height ||
+	    r.format != SPA_VIDEO_FORMAT_NV12 ||
+	    ((r.flags & SPA_VIDEO_FLAG_MODIFIER) && r.modifier != 0) ||
+	    !r.size.width || !r.size.height ||
 	    (r.size.width & 1) || (r.size.height & 1)) {
 		pw_stream_set_error(c->out, -EINVAL, "only even-sized NV12 is supported");
 		return;
@@ -648,6 +797,7 @@ static void on_out_state(void *data, enum pw_stream_state old, enum pw_stream_st
 		cam_start_input(c);
 	} else if (old == PW_STREAM_STATE_STREAMING) {
 		/* no client: release the camera */
+		cancel_retry(c);
 		cam_stop_input(c);
 	}
 }
@@ -709,6 +859,7 @@ static int cam_publish(struct cam *c)
 		return -ENOTSUP;
 	}
 
+	int nformats = n;
 	params[n++] = effect_props(c, &b);
 	char name[384], desc[384], prio[16];
 	if (c->app->stream_name) {
@@ -735,7 +886,7 @@ static int cam_publish(struct cam *c)
 		return -errno;
 	pw_stream_add_listener(c->out, &c->out_listener, &out_events, c);
 	fprintf(stderr, "camera-denoise: publishing %s for %s (%d formats)\n", name,
-		c->src_name, n);
+		c->src_name, nformats);
 	return pw_stream_connect(c->out, PW_DIRECTION_OUTPUT, PW_ID_ANY,
 				 PW_STREAM_FLAG_DRIVER | PW_STREAM_FLAG_MAP_BUFFERS,
 				 params, (uint32_t)n);
@@ -832,6 +983,8 @@ static const struct pw_core_events core_events = {
 
 static void cam_destroy(struct cam *c)
 {
+	if (c->retry)
+		pw_loop_destroy_source(pw_main_loop_get_loop(c->app->loop), c->retry);
 	cam_stop_input(c);
 	if (c->out) {
 		spa_hook_remove(&c->out_listener);
@@ -845,8 +998,11 @@ static void cam_destroy(struct cam *c)
 		free(c->formats[i]);
 	if (c->bstate)
 		c->ops->destroy(c->bstate);
+	if (c->ml_state)
+		c->ml_ops->destroy(c->ml_state);
 	cdn_noise_tracker_free(&c->noise);
 	free(c->copy);
+	free(c->stage);
 	spa_list_remove(&c->link);
 	free(c);
 }
@@ -864,8 +1020,9 @@ static void on_global(void *data, uint32_t id, uint32_t perms, const char *type,
 	cls = spa_dict_lookup(props, PW_KEY_MEDIA_CLASS);
 	if (!cls || strcmp(cls, "Video/Source") || spa_dict_lookup(props, OWN_PROP))
 		return;
-	/* nothing to decide on and not forced on: leave cameras alone */
-	if (!a->stream_name && a->cfg.mode != CDN_MODE_ON && !a->cfg.trig.enter_gain &&
+	/* no temporal filter, no session, nothing to decide on and not forced on:
+	 * leave cameras alone */
+	if (!a->stream_name && !a->cfg.temporal && a->cfg.mode != CDN_MODE_ON && !a->cfg.trig.enter_gain &&
 	    a->cfg.trig.enter_noise <= 0) {
 		static bool said;
 		if (!said)
@@ -950,6 +1107,7 @@ static void usage(void)
 {
 	fprintf(stderr,
 		"usage: aurora-camera-denoise [--mode auto|on|off] [--backend auto|cpu|NAME]\n"
+		"                             [--temporal-backend auto|cpu|gpu]\n"
 		"                             [--boards FILE] [--config FILE] [--stream NAME] [--verbose] [--print-config]\n");
 }
 
@@ -958,6 +1116,7 @@ int main(int argc, char **argv)
 	static const struct option opts[] = {
 		{ "mode", required_argument, NULL, 'm' },
 		{ "backend", required_argument, NULL, 'b' },
+		{ "temporal-backend", required_argument, NULL, 't' },
 		{ "boards", required_argument, NULL, 'B' },
 		{ "config", required_argument, NULL, 'c' },
 		{ "stream", required_argument, NULL, 's' },
@@ -970,10 +1129,11 @@ int main(int argc, char **argv)
 	bool print_only = false;
 	int o;
 
-	while ((o = getopt_long(argc, argv, "m:b:B:c:s:vph", opts, NULL)) != -1) {
+	while ((o = getopt_long(argc, argv, "m:b:t:B:c:s:vph", opts, NULL)) != -1) {
 		switch (o) {
 		case 'm': a.cli_mode = optarg; break;
 		case 'b': a.cli_backend = optarg; break;
+		case 't': a.cli_temporal_backend = optarg; break;
 		case 'B': a.boards_path = optarg; break;
 		case 'c': a.cli_config = optarg; break;
 		case 's':

@@ -1,0 +1,35 @@
+// SPDX-License-Identifier: MIT
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "common.glsl"
+layout(local_size_x=128) in;
+shared uint bins[256];
+shared uint count, total;
+void main() {
+    uint lane=gl_LocalInvocationID.x;
+    bins[lane]=0; bins[lane+128]=0;
+    if(lane==0) { count=0; total=0; }
+    barrier();
+    int block=int(gl_WorkGroupID.x), b=block%144;
+    bool c=block>=144;
+    int bw=pc.w/16, bh=(c?pc.h/2:pc.h)/9, step=c?3:2;
+    int nx=max(0,(bw-2+step-1)/step), ny=max(0,(bh-2+3)/4);
+    for(int j=int(lane);j<nx*ny;j+=128) {
+        int x=(b%16)*bw+1+(j%nx)*step, y=(b/16)*bh+1+(j/nx)*4;
+        int v=src(x,y,c), h=hist[(c?HC:HY)+y*pc.w+x];
+        atomicAdd(bins[abs(v-sat((h+8)>>4))],1);
+        atomicAdd(total,uint(v)); atomicAdd(count,1);
+    }
+    barrier();
+    if(lane==0) {
+        int med=-1;
+        if(count>0 && total/count>=20 && total/count<=245) {
+            uint acc=0, mid=count/2;
+            for(int j=0;j<256;j++) {
+                acc+=bins[j];
+                if(acc>mid) { med=j*16+int(((mid-(acc-bins[j]))*16)/bins[j]); break; }
+            }
+        }
+        par[MED+block]=med;
+    }
+}
