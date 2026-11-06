@@ -3,11 +3,15 @@
 `cdn-backend-gpu.so` implements the ABI v1 backend on Vulkan 1.1 compute.
 It needs no display server or window surface. Honeykrisp/Borealis use the
 same shaders on G13/G14/G16/G17; actual driver/device validation is recorded
-separately below. A working hardware device is preferred automatically for
-the always-on temporal stage. Missing plugin/device or a processing error
-falls back to CPU. Processing failure recreates CPU history, so its first
-frame passes through and temporal averaging warms up again. `--backend cpu` forces the CPU baseline, including the
-temporal stage. The gain-triggered low-light plugin remains independent.
+separately below. The temporal stage stays on the CPU unless you ask for
+the GPU with `temporal-backend = gpu` in `denoise.conf` or
+`--temporal-backend gpu`. `auto` means CPU for now, because on the Neo this
+path costs about 3.3 times the CPU path's energy (see below). With the GPU
+asked for, a missing plugin or device or a processing error falls back to
+CPU. Processing failure recreates CPU history, so its first frame passes
+through and temporal averaging warms up again. `--backend cpu` forces the
+CPU baseline, including the temporal stage. The gain-triggered low-light
+plugin remains independent.
 
 Build with Vulkan development headers/loader and `glslangValidator`:
 
@@ -135,8 +139,8 @@ python3 tools/make-test-clip.py /tmp/synthetic.nv12  # requires numpy
 ```
 
 For the live comparison, use the same 1080p30 scene and one streaming
-client with the low-light stage held equal. Run both `--backend cpu` and
-`--backend auto`, record the selected device/transport, per-frame callback
+client with the low-light stage held equal. Run both `--temporal-backend cpu` and
+`--temporal-backend gpu`, record the selected device/transport, per-frame callback
 latency and process CPU after warmup, and sample GPU busy and system power
 using the device's available GPU/PMP/SMC telemetry. Record ambient light,
 clock/governor, software revisions, sampling interval, baseline power and
@@ -152,12 +156,17 @@ still required on each target.
 | Device | Backend | Filter latency (ms; statistic) | Process CPU at 1080p30 | GPU busy | System power (PMP/SMC) | Parity vs CPU |
 | --- | --- | --- | --- | --- | --- | --- |
 | Neo / G17 | CPU, earlier live reference | 15.1–15.3, logged means | 46% of one core | unmeasured | unmeasured | reference |
-| Neo / G17 | GPU | pending lead run | pending | pending | pending | pending recorded frames |
+| Neo / G17 | CPU, live 11-01 | 14.3, mean | 42% of one core | unmeasured | 2034 mW (+397 mW over camera alone) | reference |
+| Neo / G17 | GPU, live 11-01 | 6.1, mean | 3.5% of one core | unmeasured | 2960 mW (+1323 mW over camera alone) | pending recorded frames |
 | J616s / G16 | CPU, earlier live reference | 15.1–17.1, logged means | 48% of one core | unmeasured | unmeasured | reference |
 | J616s / G16 | GPU | pending lead run | pending | pending | pending | pending recorded frames |
 | M1 Pro / G13 | CPU / GPU | pending lead run | pending | pending | pending | pending recorded frames |
 | M2 / G14 | CPU / GPU | pending lead run | pending | pending | pending | pending recorded frames |
 
-No Apple GPU performance or power claim is made until these paired rows
-are populated. Hardware runs belong to the camera-quality lead; this code
+The Neo rows from 11-01 are 10 s means of the SMC PPMC rail at 1080p30 with
+the camera open, at real governor clocks. The camera node alone drew
+1637 mW. The GPU path is faster per frame but uses about 3.3 times the
+CPU path's extra energy, which is why `auto` stays on the CPU. Likely costs
+to look at first are per-frame submit and fence waits holding GPU clocks up,
+the output copy and the number of dispatches per frame. Hardware runs belong to the camera-quality lead; this code
 change does not install anything or alter device services.

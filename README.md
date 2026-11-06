@@ -6,7 +6,7 @@ It runs as a user service. For each built-in camera (the `apple-isp` V4L2 driver
 
 ## When it filters
 
-The temporal filter runs on every frame of every stream, on Vulkan compute when the GPU plugin works and on CPU otherwise, as macOS runs its motion-compensated temporal filter on every camera stream. It's what makes the macOS camera look clean in a normal room. Measured on the MacBook Pro 16-inch M4 Pro, same scene, on a flat part of the picture: luma noise 13.6 straight from the camera, 2.4 through this filter and 2.1 on macOS (8-bit code values).
+The temporal filter runs on every frame of every stream, as macOS runs its motion-compensated temporal filter on every camera stream. It's what makes the macOS camera look clean in a normal room. Measured on the MacBook Pro 16-inch M4 Pro, same scene, on a flat part of the picture: luma noise 13.6 straight from the camera, 2.4 through this filter and 2.1 on macOS (8-bit code values).
 
 A low-light stage joins in on top when a backend plugin such as the Neural Engine one is installed, like macOS' machine-learning noise reduction. In `auto` mode it follows two signals, each with its own on and off level so it does not flicker:
 
@@ -31,12 +31,13 @@ Copy `/usr/share/aurora-camera-denoise/examples/denoise.conf` to `~/.config/auro
 - `mode = auto | on | off`, where `off` passes every frame through unchanged
 - `low-light-frame-rate = on | off`. With `on` (the default) the camera may slow down to 15 fps in low light for a longer exposure instead of more gain, as macOS lets it. The filter sets this on the camera before it streams; `off` keeps a fixed frame rate
 - `temporal = on | off`. With `off` the filter works as it did before: nothing runs below the levels, and above them the one backend (Neural Engine or CPU) does all the work
-- `backend = auto | cpu`, where `auto` prefers GPU for the temporal stage and uses the Neural Engine backend for low light when installed and working; `cpu` forces CPU for measurements
+- `temporal-backend = auto | cpu | gpu`, where `auto` is the CPU. `gpu` runs the temporal filter on Vulkan compute when the GPU plugin is installed and works, else the CPU. It is opt-in because it costs more energy than the CPU today
+- `backend = auto | cpu`, where `auto` uses the Neural Engine backend for low light when installed and working; `cpu` forces the CPU for both stages, for measurements
 - any board level, e.g. `enter-gain = 1536`, or `enter-noise = 0` to follow the gain only
 
 To turn it off completely, `systemctl --user mask --now aurora-camera-denoise`. The distro packages enable it for every user through a preset, so `disable` alone does not stick.
 
-The optional [Vulkan backend](docs/gpu-backend.md) implements the same filter, including noise estimation, on the GPU. It imports linear camera DMA-BUFs when supported and otherwise uploads once. Build with `-Dgpu=enabled` to require it.
+The optional [Vulkan backend](docs/gpu-backend.md) implements the same filter, including noise estimation, on the GPU, when you set `temporal-backend = gpu`. It imports linear camera DMA-BUFs when supported and otherwise uploads once. Build with `-Dgpu=enabled` to require it.
 
 ## How the filter works
 

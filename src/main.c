@@ -126,7 +126,7 @@ struct app {
 	struct spa_hook registry_listener;
 	struct spa_list cams;
 	struct cdn_config cfg;
-	const char *cli_mode, *cli_backend;
+	const char *cli_mode, *cli_backend, *cli_temporal_backend;
 	const char *boards_path;
 	bool verbose;
 };
@@ -158,6 +158,14 @@ static int load_config(struct app *a)
 	}
 	if (a->cli_backend)
 		snprintf(a->cfg.backend, sizeof(a->cfg.backend), "%s", a->cli_backend);
+	if (a->cli_temporal_backend) {
+		const char *t = a->cli_temporal_backend;
+		if (strcmp(t, "auto") && strcmp(t, "cpu") && strcmp(t, "gpu")) {
+			fprintf(stderr, "camera-denoise: bad --temporal-backend %s\n", t);
+			return -1;
+		}
+		snprintf(a->cfg.temporal_backend, sizeof(a->cfg.temporal_backend), "%s", t);
+	}
 	cdn_config_print(&a->cfg);
 	return 0;
 }
@@ -534,9 +542,9 @@ static void setup_backend(struct cam *c)
 	c->ml_ops = NULL;
 
 	if (cfg->temporal) {
-		/* Prefer GPU temporal; keep the low-light plugin independently gated.
-		 * --backend cpu is also an explicit CPU baseline for measurements. */
-		c->ops = !strcmp(cfg->backend, "cpu") ? cdn_cpu_backend() : cdn_backend_find("gpu", NULL);
+		/* CPU temporal unless the GPU is asked for, with the low-light
+		 * plugin gated on its own. */
+		c->ops = cdn_backend_find(cdn_temporal_backend(cfg), NULL);
 		if (c->ops) c->bstate = c->ops->create(w, h, cfg->threads);
 		if (!c->bstate) {
 			c->ops = cdn_cpu_backend();
@@ -921,6 +929,7 @@ static void usage(void)
 {
 	fprintf(stderr,
 		"usage: aurora-camera-denoise [--mode auto|on|off] [--backend auto|cpu|NAME]\n"
+		"                             [--temporal-backend auto|cpu|gpu]\n"
 		"                             [--boards FILE] [--verbose] [--print-config]\n");
 }
 
@@ -929,6 +938,7 @@ int main(int argc, char **argv)
 	static const struct option opts[] = {
 		{ "mode", required_argument, NULL, 'm' },
 		{ "backend", required_argument, NULL, 'b' },
+		{ "temporal-backend", required_argument, NULL, 't' },
 		{ "boards", required_argument, NULL, 'B' },
 		{ "verbose", no_argument, NULL, 'v' },
 		{ "print-config", no_argument, NULL, 'p' },
@@ -939,10 +949,11 @@ int main(int argc, char **argv)
 	bool print_only = false;
 	int o;
 
-	while ((o = getopt_long(argc, argv, "m:b:B:vph", opts, NULL)) != -1) {
+	while ((o = getopt_long(argc, argv, "m:b:t:B:vph", opts, NULL)) != -1) {
 		switch (o) {
 		case 'm': a.cli_mode = optarg; break;
 		case 'b': a.cli_backend = optarg; break;
+		case 't': a.cli_temporal_backend = optarg; break;
 		case 'B': a.boards_path = optarg; break;
 		case 'v': a.verbose = true; break;
 		case 'p': print_only = true; break;

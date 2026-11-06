@@ -38,6 +38,13 @@ int main(int argc, char **argv)
 	CHECK(c.mode == CDN_MODE_AUTO && !strcmp(c.backend, "auto"));
 	CHECK(c.temporal);
 	CHECK(c.low_light_frame_rate);
+	/* the GPU temporal path costs more energy than the CPU one: opt-in only */
+	CHECK(!strcmp(c.temporal_backend, "auto"));
+	CHECK(!strcmp(cdn_temporal_backend(&c), "cpu"));
+	snprintf(c.temporal_backend, sizeof(c.temporal_backend), "gpu");
+	CHECK(!strcmp(cdn_temporal_backend(&c), "gpu"));
+	snprintf(c.backend, sizeof(c.backend), "cpu");
+	CHECK(!strcmp(cdn_temporal_backend(&c), "cpu"));
 
 	const char *s1[] = { "/nonexistent", user };
 	CHECK(cdn_config_load(&c, compat, boards, s1, 2) == 0);
@@ -45,6 +52,16 @@ int main(int argc, char **argv)
 	CHECK(!c.temporal);
 	CHECK(!c.low_light_frame_rate);
 	CHECK(c.trig.enter_gain == 2304 && c.trig.exit_gain == 1500);
+
+	f = fopen(user, "w");
+	fputs("[denoise]\ntemporal-backend = gpu\n", f);
+	fclose(f);
+	CHECK(cdn_config_load(&c, compat, boards, s1, 2) == 0);
+	CHECK(!strcmp(cdn_temporal_backend(&c), "gpu") && !strcmp(c.backend, "auto"));
+	f = fopen(user, "w");
+	fputs("[denoise]\ntemporal-backend = vulkan\n", f);
+	fclose(f);
+	CHECK(cdn_config_load(&c, compat, boards, s1, 2) != 0);
 
 	const char *s2[] = { bad };
 	CHECK(cdn_config_load(&c, compat, boards, s2, 1) != 0);
