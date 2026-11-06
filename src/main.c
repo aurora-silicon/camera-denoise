@@ -77,6 +77,13 @@ struct cam {
 	struct pw_stream *in;
 	struct spa_hook in_listener;
 	bool out_streaming;
+	/*
+	 * The camera can be busy (another program holds it) or fail when a
+	 * client starts. Then retry the input with a backoff for as long as
+	 * a client is waiting, instead of leaving the client with no frames.
+	 */
+	struct spa_source *retry;
+	int retry_ms;
 
 	struct spa_video_info_raw fmt; /* negotiated on out */
 	bool have_fmt;
@@ -359,6 +366,47 @@ drop_frame:
 	pw_stream_queue_buffer(c->out, ob);
 }
 
+static int cam_start_input(struct cam *c);
+static void cam_stop_input(struct cam *c);
+
+#define RETRY_FIRST_MS 250
+#define RETRY_MAX_MS 2000
+
+static void on_retry(void *data, uint64_t expirations)
+{
+	struct cam *c = data;
+
+	(void)expirations;
+	cam_stop_input(c);
+	if (c->out_streaming && cam_start_input(c) < 0)
+		fprintf(stderr, "camera-denoise: %s: cannot restart the input\n", c->src_nick);
+}
+
+static void schedule_retry(struct cam *c)
+{
+	struct pw_loop *l = pw_main_loop_get_loop(c->app->loop);
+	struct timespec ts;
+
+	if (!c->retry)
+		c->retry = pw_loop_add_timer(l, on_retry, c);
+	if (!c->retry)
+		return;
+	c->retry_ms = c->retry_ms ? c->retry_ms * 2 : RETRY_FIRST_MS;
+	if (c->retry_ms > RETRY_MAX_MS)
+		c->retry_ms = RETRY_MAX_MS;
+	ts.tv_sec = c->retry_ms / 1000;
+	ts.tv_nsec = (long)(c->retry_ms % 1000) * 1000000L;
+	pw_loop_update_timer(l, c->retry, &ts, NULL, false);
+}
+
+static void cancel_retry(struct cam *c)
+{
+	if (c->retry)
+		pw_loop_update_timer(pw_main_loop_get_loop(c->app->loop), c->retry,
+				     NULL, NULL, false);
+	c->retry_ms = 0;
+}
+
 static void on_in_state(void *data, enum pw_stream_state old, enum pw_stream_state state,
 			const char *error)
 {
@@ -367,6 +415,16 @@ static void on_in_state(void *data, enum pw_stream_state old, enum pw_stream_sta
 	if (c->app->verbose || state == PW_STREAM_STATE_ERROR)
 		fprintf(stderr, "camera-denoise: %s: input %s%s%s\n", c->src_nick,
 			pw_stream_state_as_string(state), error ? ": " : "", error ? error : "");
+	if (state == PW_STREAM_STATE_ERROR && c->out_streaming) {
+		/* the stream can't be destroyed from its own callback: use the timer */
+		if (!c->retry_ms)
+			fprintf(stderr, "camera-denoise: %s: camera unavailable, retrying while "
+				"a client waits\n", c->src_nick);
+		schedule_retry(c);
+	} else if (state == PW_STREAM_STATE_STREAMING && c->retry_ms) {
+		fprintf(stderr, "camera-denoise: %s: camera available again\n", c->src_nick);
+		c->retry_ms = 0;
+	}
 	(void)old;
 }
 
@@ -425,6 +483,17 @@ static int cam_start_input(struct cam *c)
 
 	r.format = SPA_VIDEO_FORMAT_NV12;
 	params[0] = spa_format_video_raw_build(&b, SPA_PARAM_EnumFormat, &r);
+	/*
+	 * Before the camera streams: may it slow down in low light? A camera
+	 * that is already streaming for another client keeps its setting.
+	 */
+	if (c->v4l2_path[0]) {
+		int err = cdn_v4l2_set_exposure_priority(c->v4l2_path,
+							 c->app->cfg.low_light_frame_rate);
+		if (err && err != -ENOTTY)
+			fprintf(stderr, "camera-denoise: %s: low-light frame rate not set: %s\n",
+				c->src_nick, strerror(-err));
+	}
 	c->last_pts = 0;
 	c->fps_meas = 0;
 	return pw_stream_connect(c->in, PW_DIRECTION_INPUT, PW_ID_ANY,
@@ -568,6 +637,7 @@ static void on_out_state(void *data, enum pw_stream_state old, enum pw_stream_st
 		cam_start_input(c);
 	} else if (old == PW_STREAM_STATE_STREAMING) {
 		/* no client: release the camera */
+		cancel_retry(c);
 		cam_stop_input(c);
 	}
 }
@@ -745,6 +815,8 @@ static const struct pw_core_events core_events = {
 
 static void cam_destroy(struct cam *c)
 {
+	if (c->retry)
+		pw_loop_destroy_source(pw_main_loop_get_loop(c->app->loop), c->retry);
 	cam_stop_input(c);
 	if (c->out) {
 		spa_hook_remove(&c->out_listener);

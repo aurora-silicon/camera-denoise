@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: MIT
+#include <errno.h>
 #include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
@@ -57,6 +58,26 @@ void cdn_gain_close(struct cdn_gain *g)
 	if (g->fd >= 0)
 		close(g->fd);
 	g->fd = -1;
+}
+
+int cdn_v4l2_set_exposure_priority(const char *path, bool on)
+{
+	struct v4l2_queryctrl q = { .id = V4L2_CID_EXPOSURE_AUTO_PRIORITY };
+	struct v4l2_control c = { .id = V4L2_CID_EXPOSURE_AUTO_PRIORITY, .value = on };
+	int fd, err = 0;
+
+	if (!path || !*path)
+		return -ENOENT;
+	fd = open(path, O_RDWR | O_NONBLOCK | O_CLOEXEC);
+	if (fd < 0)
+		return -errno;
+	if (ioctl(fd, VIDIOC_QUERYCTRL, &q) ||
+	    (q.flags & (V4L2_CTRL_FLAG_DISABLED | V4L2_CTRL_FLAG_READ_ONLY)))
+		err = -ENOTTY;
+	else if (ioctl(fd, VIDIOC_S_CTRL, &c))
+		err = -errno;
+	close(fd);
+	return err;
 }
 
 #define NT_STEP 4

@@ -29,6 +29,7 @@ Kernels without the gain report fall back to the noise signal alone.
 Copy `/usr/share/aurora-camera-denoise/examples/denoise.conf` to `~/.config/aurora-camera-denoise/denoise.conf` (or `/etc/aurora-camera-denoise/denoise.conf` for everyone) and change what you like, then `systemctl --user reload aurora-camera-denoise`.
 
 - `mode = auto | on | off`, where `off` passes every frame through unchanged
+- `low-light-frame-rate = on | off`. With `on` (the default) the camera may slow down to 15 fps in low light for a longer exposure instead of more gain, as macOS lets it. The filter sets this on the camera before it streams; `off` keeps a fixed frame rate
 - `temporal = on | off`. With `off` the filter works as it did before: nothing runs below the levels, and above them the one backend (Neural Engine or CPU) does all the work
 - `backend = auto | cpu`, where `auto` prefers GPU for the temporal stage and uses the Neural Engine backend for low light when installed and working; `cpu` forces CPU for measurements
 - any board level, e.g. `enter-gain = 1536`, or `enter-noise = 0` to follow the gain only
