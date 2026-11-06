@@ -70,6 +70,8 @@ if pipewire.found()
     dependencies : [core_dep, pipewire], install : true)
   test('buffers', executable('test_buffers', 'tests/test_buffers.c', 'src/pipewire-frame.c',
     dependencies : [core_dep, pipewire]))
+  test('formats', executable('test_formats', 'tests/test_formats.c', 'src/pipewire-frame.c',
+    dependencies : [core_dep, pipewire]))
 endif
 
 executable('aurora-camera-denoise-bench', 'tools/cdn-bench.c',

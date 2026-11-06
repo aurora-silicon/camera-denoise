@@ -597,7 +597,7 @@ static void on_out_param_changed(void *data, uint32_t id, const struct spa_pod *
 	if (spa_format_parse(param, &mtype, &msub) < 0 || mtype != SPA_MEDIA_TYPE_video ||
 	    msub != SPA_MEDIA_SUBTYPE_raw || spa_format_video_raw_parse(param, &r) < 0 ||
 	    r.format != SPA_VIDEO_FORMAT_NV12 ||
-	    ((r.flags & SPA_VIDEO_FLAG_MODIFIER) && r.modifier != 0) ||
+	    (r.flags & SPA_VIDEO_FLAG_MODIFIER) ||
 	    !r.size.width || !r.size.height ||
 	    (r.size.width & 1) || (r.size.height & 1)) {
 		pw_stream_set_error(c->out, -EINVAL, "only even-sized NV12 is supported");
@@ -656,52 +656,15 @@ static const struct pw_stream_events out_events = {
 	.param_changed = on_out_param_changed,
 };
 
-static bool pod_is_nv12(const struct spa_pod *p)
-{
-	const struct spa_pod_prop *prop;
-	uint32_t n, choice, *vals;
-	const struct spa_pod *v;
-
-	if (!spa_pod_is_object(p))
-		return false;
-	prop = spa_pod_find_prop(p, NULL, SPA_FORMAT_VIDEO_format);
-	if (!prop)
-		return false;
-	v = spa_pod_get_values(&prop->value, &n, &choice);
-	if (v->type != SPA_TYPE_Id)
-		return false;
-	vals = SPA_POD_BODY(v);
-	for (uint32_t i = 0; i < n; i++)
-		if (vals[i] == SPA_VIDEO_FORMAT_NV12)
-			return true;
-	return false;
-}
-
 static int cam_publish(struct cam *c)
 {
 	struct pw_properties *props;
 	const struct spa_pod *params[MAX_FORMATS];
-	uint8_t buf[4096];
-	struct spa_pod_builder b = SPA_POD_BUILDER_INIT(buf, sizeof(buf));
 	int n = 0;
 
-	for (int i = 0; i < c->n_formats; i++) {
-		/* the camera's NV12 format with its sizes and rates, as is */
-		struct spa_pod_frame f;
-		const struct spa_pod_object *o = (const struct spa_pod_object *)c->formats[i];
-		struct spa_pod_prop *prop;
-
-		spa_pod_builder_push_object(&b, &f, SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat);
-		SPA_POD_OBJECT_FOREACH(o, prop) {
-			if (prop->key == SPA_FORMAT_VIDEO_format) {
-				spa_pod_builder_prop(&b, SPA_FORMAT_VIDEO_format, 0);
-				spa_pod_builder_id(&b, SPA_VIDEO_FORMAT_NV12);
-			} else {
-				spa_pod_builder_raw_padded(&b, prop, SPA_POD_PROP_SIZE(prop));
-			}
-		}
-		params[n++] = spa_pod_builder_pop(&b, &f);
-	}
+	/* the camera's NV12 sizes and rates, without a DMA-BUF modifier */
+	for (int i = 0; i < c->n_formats; i++)
+		params[n++] = c->formats[i];
 	if (!n) {
 		fprintf(stderr, "camera-denoise: %s offers no NV12 format\n", c->src_nick);
 		return -ENOTSUP;
@@ -748,8 +711,21 @@ static void src_param(void *data, int seq, uint32_t id, uint32_t index, uint32_t
 		fprintf(stderr, "camera-denoise: %s format %u:\n", c->src_nick, index);
 		spa_debug_format(4, NULL, param);
 	}
-	if (c->n_formats < MAX_FORMATS && pod_is_nv12(param))
-		c->formats[c->n_formats++] = spa_pod_copy(param);
+	/* The camera lists each size with and without a modifier: keep one. */
+	struct spa_pod *fmt = cdn_output_format(param);
+
+	if (!fmt)
+		return;
+	for (int i = 0; i < c->n_formats; i++) {
+		if (cdn_format_equal(c->formats[i], fmt)) {
+			free(fmt);
+			return;
+		}
+	}
+	if (c->n_formats < MAX_FORMATS)
+		c->formats[c->n_formats++] = fmt;
+	else
+		free(fmt);
 }
 
 static void src_info(void *data, const struct pw_node_info *info)
