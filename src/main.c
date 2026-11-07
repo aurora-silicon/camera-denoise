@@ -26,6 +26,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #include <pipewire/pipewire.h>
 #include <spa/param/video/format-utils.h>
@@ -37,6 +38,7 @@
 #include "backend.h"
 #include "config.h"
 #include "gain.h"
+#include "effects.h"
 #include "pipewire-frame.h"
 #include "trigger.h"
 
@@ -92,6 +94,8 @@ struct cam {
 	/* the temporal stage, or with temporal = off the gated backend */
 	const struct cdn_backend_ops *ops;
 	void *bstate;
+	struct cdn_effects *effects;
+	struct ce_config effect_cfg;
 	/* the low-light stage on top of the temporal one, if a plugin runs */
 	const struct cdn_backend_ops *ml_ops;
 	void *ml_state;
@@ -126,8 +130,9 @@ struct app {
 	struct spa_hook registry_listener;
 	struct spa_list cams;
 	struct cdn_config cfg;
-	const char *cli_mode, *cli_backend, *cli_temporal_backend;
+	const char *cli_mode, *cli_backend, *cli_config, *cli_temporal_backend;
 	const char *boards_path;
+	const char *stream_name;
 	bool verbose;
 };
 
@@ -139,6 +144,7 @@ static int cam_start_input(struct cam *c);
 static int load_config(struct app *a)
 {
 	char user[PATH_MAX];
+	struct cdn_config next;
 	const char *xdg = getenv("XDG_CONFIG_HOME"), *home = getenv("HOME");
 	const char *settings[2] = { CDN_SYSCONFDIR "/aurora-camera-denoise/denoise.conf", NULL };
 
@@ -149,23 +155,33 @@ static int load_config(struct app *a)
 	else
 		user[0] = 0;
 	settings[1] = user[0] ? user : NULL;
-	if (cdn_config_load(&a->cfg, "/proc/device-tree/compatible", a->boards_path,
+	/* An explicit session config isolates demos from the user's default service. */
+	if (a->cli_config) {
+		if (access(a->cli_config, R_OK) < 0) {
+			fprintf(stderr, "camera-denoise: config %s: %s\n", a->cli_config, strerror(errno));
+			return -1;
+		}
+		settings[0] = a->cli_config;
+		settings[1] = NULL;
+	}
+	if (cdn_config_load(&next, "/proc/device-tree/compatible", a->boards_path,
 			    settings, 2))
 		return -1;
-	if (a->cli_mode && cdn_mode_parse(a->cli_mode, &a->cfg.mode)) {
+	if (a->cli_mode && cdn_mode_parse(a->cli_mode, &next.mode)) {
 		fprintf(stderr, "camera-denoise: bad --mode %s\n", a->cli_mode);
 		return -1;
 	}
 	if (a->cli_backend)
-		snprintf(a->cfg.backend, sizeof(a->cfg.backend), "%s", a->cli_backend);
+		snprintf(next.backend, sizeof(next.backend), "%s", a->cli_backend);
 	if (a->cli_temporal_backend) {
 		const char *t = a->cli_temporal_backend;
 		if (strcmp(t, "auto") && strcmp(t, "cpu") && strcmp(t, "gpu")) {
 			fprintf(stderr, "camera-denoise: bad --temporal-backend %s\n", t);
 			return -1;
 		}
-		snprintf(a->cfg.temporal_backend, sizeof(a->cfg.temporal_backend), "%s", t);
+		snprintf(next.temporal_backend, sizeof(next.temporal_backend), "%s", t);
 	}
+	a->cfg = next;
 	cdn_config_print(&a->cfg);
 	return 0;
 }
@@ -207,6 +223,109 @@ static double mono_ms(void)
 	struct timespec ts;
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
+}
+
+/* Model work runs on its own bounded worker. These controls belong to this
+ * output instance only, never to a device or another application's stream. */
+static void setup_effects(struct cam *c)
+{
+	cdn_effects_free(c->effects);
+	c->effects = NULL;
+	if (!c->have_fmt || (!c->effect_cfg.background && !c->effect_cfg.framing)) return;
+	const struct cdn_framing_cfg *board = &c->app->cfg.framing;
+	if (c->effect_cfg.framing && !board->supported) {
+		fprintf(stderr, "camera-effects: framing unsupported by this board\n");
+		return;
+	}
+	if (c->fmt.color_matrix != SPA_VIDEO_COLOR_MATRIX_UNKNOWN &&
+		c->fmt.color_matrix != SPA_VIDEO_COLOR_MATRIX_BT601 &&
+		c->fmt.color_matrix != SPA_VIDEO_COLOR_MATRIX_BT709) {
+		fprintf(stderr, "camera-effects: unsupported source color matrix\n");
+		return;
+	}
+	c->effect_cfg.abi = CE_ABI;
+	c->effect_cfg.width = c->fmt.size.width;
+	c->effect_cfg.height = c->fmt.size.height;
+	c->effect_cfg.zoom_min = board->minimum;
+	c->effect_cfg.zoom_max = board->maximum;
+	c->effect_cfg.zoom_default = board->default_zoom;
+	c->effect_cfg.matrix = c->fmt.color_matrix == SPA_VIDEO_COLOR_MATRIX_BT709 ? 709 : 601;
+	c->effect_cfg.full_range = c->fmt.color_range == SPA_VIDEO_COLOR_RANGE_0_255;
+	c->effects = cdn_effects_new(&c->effect_cfg, NULL);
+	if (!c->effects) fprintf(stderr, "camera-effects: plugin unavailable; frames pass through\n");
+}
+
+static void effect_capabilities(struct cam *c, struct pw_properties *props)
+{
+	const struct cdn_framing_cfg *board = &c->app->cfg.framing;
+	pw_properties_set(props, "camera.framing.supported", board->supported ? "true" : "false");
+	pw_properties_setf(props, "camera.zoom.min", "%.3f", board->minimum);
+	pw_properties_setf(props, "camera.zoom.max", "%.3f", board->maximum);
+	pw_properties_setf(props, "camera.zoom.default", "%.3f", board->default_zoom);
+}
+
+static const struct spa_pod *effect_props(struct cam *c, struct spa_pod_builder *b)
+{
+	struct spa_pod_frame object, values;
+	const char *names[] = { "off", "blur", "replace" };
+	spa_pod_builder_push_object(b, &object, SPA_TYPE_OBJECT_Props, SPA_PARAM_Props);
+	spa_pod_builder_prop(b, SPA_PROP_params, 0);
+	spa_pod_builder_push_struct(b, &values);
+	spa_pod_builder_string(b, "camera.background");
+	spa_pod_builder_string(b, names[c->effect_cfg.background]);
+	spa_pod_builder_string(b, "camera.framing");
+	spa_pod_builder_bool(b, c->effect_cfg.framing);
+	spa_pod_builder_string(b, "camera.zoom");
+	spa_pod_builder_float(b, c->effect_cfg.zoom);
+	spa_pod_builder_string(b, "camera.background.path");
+	spa_pod_builder_string(b, c->effect_cfg.replacement);
+	spa_pod_builder_pop(b, &values);
+	return spa_pod_builder_pop(b, &object);
+}
+
+static int set_effect_props(struct cam *c, const struct spa_pod *param)
+{
+	const struct spa_pod_prop *prop = spa_pod_find_prop(param, NULL, SPA_PROP_params);
+	const struct spa_pod *p;
+	const char *key = NULL, *value;
+	struct ce_config next = c->effect_cfg;
+	bool enabled;
+	if (!prop || !spa_pod_is_struct(&prop->value)) return -EINVAL;
+	SPA_POD_STRUCT_FOREACH(&prop->value, p) {
+		if (!key) {
+			if (spa_pod_get_string(p, &key)) return -EINVAL;
+			continue;
+		}
+		if (!strcmp(key, "camera.background")) {
+			if (spa_pod_get_string(p, &value)) return -EINVAL;
+			if (!strcmp(value, "off")) next.background = 0;
+			else if (!strcmp(value, "blur")) next.background = 1;
+			else if (!strcmp(value, "replace")) next.background = 2;
+			else return -EINVAL;
+		} else if (!strcmp(key, "camera.framing")) {
+			if (spa_pod_get_bool(p, &enabled)) return -EINVAL;
+			next.framing = enabled;
+		} else if (!strcmp(key, "camera.zoom")) {
+			if (spa_pod_get_float(p, &next.zoom)) {
+				double d;
+				if (spa_pod_get_double(p, &d)) return -EINVAL;
+				next.zoom = (float)d;
+			}
+		} else if (!strcmp(key, "camera.background.path")) {
+			if (spa_pod_get_string(p, &value) || strlen(value) >= sizeof(next.replacement)) return -EINVAL;
+			snprintf(next.replacement, sizeof(next.replacement), "%s", value);
+		} else return -EINVAL;
+		key = NULL;
+	}
+	const struct cdn_framing_cfg *board = &c->app->cfg.framing;
+	if (key || !isfinite(next.zoom) || (next.framing && !board->supported) ||
+		(next.zoom != 0 && (next.zoom < board->minimum || next.zoom > board->maximum)) ||
+		(next.background == 2 && !next.replacement[0])) return -EINVAL;
+	if (memcmp(&next, &c->effect_cfg, sizeof(next))) {
+		c->effect_cfg = next;
+		setup_effects(c);
+	}
+	return 0;
 }
 
 static int temporal_process(struct cam *c, const struct cdn_frame *in,
@@ -260,7 +379,7 @@ static void on_in_process(void *data)
 	if (!cdn_frame_from_buffer(ib->buffer, &c->fmt, &fi) || !od->data ||
 	    od->maxsize < (uint32_t)c->out_stride * h * 3 / 2) {
 		pw_stream_queue_buffer(c->in, ib);
-		pw_stream_queue_buffer(c->out, ob);
+		pw_stream_return_buffer(c->out, ob);
 		return;
 	}
 	fo = (struct cdn_frame){ od->data, (uint8_t *)od->data + (size_t)c->out_stride * h,
@@ -352,9 +471,16 @@ static void on_in_process(void *data)
 			c->ops->reset(c->bstate);
 	}
 
+	uint64_t result_pts = ih && ih->pts > 0 ? (uint64_t)ih->pts : 0;
+	uint64_t result_seq = ih ? ih->seq : c->frames;
+	bool ready = true;
+	if (c->effects) {
+		cdn_effects_submit(c->effects, &fo, result_pts, result_seq);
+		ready = cdn_effects_take(c->effects, &fo, &result_pts, &result_seq);
+	}
 	od->chunk->offset = 0;
 	od->chunk->stride = c->out_stride;
-	od->chunk->size = (uint32_t)c->out_stride * h * 3 / 2;
+	od->chunk->size = ready ? (uint32_t)c->out_stride * h * 3 / 2 : 0;
 	od->chunk->flags = 0;
 	oh = spa_buffer_find_meta_data(ob->buffer, SPA_META_Header, sizeof(*oh));
 	if (oh) {
@@ -362,16 +488,30 @@ static void on_in_process(void *data)
 			*oh = *ih;
 		else
 			oh->pts = -1;
+		if (c->effects) {
+			oh->pts = result_pts ? (int64_t)result_pts : -1;
+			oh->seq = result_seq;
+			oh->flags = 0;
+			oh->offset = 0;
+			oh->dts_offset = 0;
+		}
 	}
 	pw_stream_queue_buffer(c->in, ib);
-	pw_stream_queue_buffer(c->out, ob);
-	pw_stream_trigger_process(c->out);
+	if (ready) {
+		pw_stream_queue_buffer(c->out, ob);
+		pw_stream_trigger_process(c->out);
+	} else {
+		/* No complete model result yet: recycle this buffer without putting
+		 * an empty frame into the driver's queue. Otherwise a model stall
+		 * can consume every output buffer and prevent future take() calls. */
+		pw_stream_return_buffer(c->out, ob);
+	}
 	log_stats(c, strength, gain, noise);
 	return;
 
 drop_frame:
 	pw_stream_queue_buffer(c->in, ib);
-	pw_stream_queue_buffer(c->out, ob);
+	pw_stream_return_buffer(c->out, ob);
 }
 
 static int cam_start_input(struct cam *c);
@@ -476,6 +616,7 @@ static int cam_start_input(struct cam *c)
 
 	if (c->in || !c->have_fmt)
 		return 0;
+	setup_effects(c);
 	props = pw_properties_new(PW_KEY_MEDIA_TYPE, "Video",
 				  PW_KEY_MEDIA_CATEGORY, "Capture",
 				  PW_KEY_MEDIA_ROLE, "Camera",
@@ -511,6 +652,8 @@ static int cam_start_input(struct cam *c)
 
 static void cam_stop_input(struct cam *c)
 {
+	cdn_effects_free(c->effects);
+	c->effects = NULL;
 	if (!c->in)
 		return;
 	spa_hook_remove(&c->in_listener);
@@ -587,6 +730,14 @@ static void on_out_param_changed(void *data, uint32_t id, const struct spa_pod *
 	uint32_t mtype, msub;
 	struct spa_video_info_raw r = { 0 };
 
+	if (id == SPA_PARAM_Props && param) {
+		if (set_effect_props(c, param)) fprintf(stderr, "camera-effects: invalid stream control transaction\n");
+		uint8_t props_buf[2048];
+		struct spa_pod_builder pb = SPA_POD_BUILDER_INIT(props_buf, sizeof(props_buf));
+		const struct spa_pod *props = effect_props(c, &pb);
+		pw_stream_update_params(c->out, &props, 1);
+		return;
+	}
 	if (id != SPA_PARAM_Format)
 		return;
 	if (!param) {
@@ -604,7 +755,8 @@ static void on_out_param_changed(void *data, uint32_t id, const struct spa_pod *
 		return;
 	}
 	bool changed = !c->have_fmt || memcmp(&r.size, &c->fmt.size, sizeof(r.size)) ||
-		       memcmp(&r.framerate, &c->fmt.framerate, sizeof(r.framerate));
+		       memcmp(&r.framerate, &c->fmt.framerate, sizeof(r.framerate)) ||
+			   r.color_matrix != c->fmt.color_matrix || r.color_range != c->fmt.color_range;
 	c->fmt = r;
 	c->have_fmt = true;
 	c->out_stride = SPA_ROUND_UP_N((int)r.size.width, 16);
@@ -659,7 +811,9 @@ static const struct pw_stream_events out_events = {
 static int cam_publish(struct cam *c)
 {
 	struct pw_properties *props;
-	const struct spa_pod *params[MAX_FORMATS];
+	const struct spa_pod *params[MAX_FORMATS + 1];
+	uint8_t buf[4096];
+	struct spa_pod_builder b = SPA_POD_BUILDER_INIT(buf, sizeof(buf));
 	int n = 0;
 
 	/* the camera's NV12 sizes and rates, without a DMA-BUF modifier */
@@ -670,11 +824,18 @@ static int cam_publish(struct cam *c)
 		return -ENOTSUP;
 	}
 
-	char name[300], desc[300], prio[16];
-	snprintf(name, sizeof(name), "aurora_camera_denoise.%s", c->src_name);
+	int nformats = n;
+	params[n++] = effect_props(c, &b);
+	char name[384], desc[384], prio[16];
+	if (c->app->stream_name) {
+		snprintf(name, sizeof(name), "aurora_camera_denoise.%s.%s", c->app->stream_name, c->src_name);
+	} else {
+		snprintf(name, sizeof(name), "aurora_camera_denoise.%s", c->src_name);
+	}
 	/* the clean picture is the camera; the raw node stays as "(V4L2)" */
-	snprintf(desc, sizeof(desc), "%s", c->src_nick[0] ? c->src_nick : c->src_desc);
-	snprintf(prio, sizeof(prio), "%d", c->src_prio + 10);
+	snprintf(desc, sizeof(desc), "%s%s%s", c->src_nick[0] ? c->src_nick : c->src_desc,
+		c->app->stream_name ? " / " : "", c->app->stream_name ?: "");
+	snprintf(prio, sizeof(prio), "%d", c->app->stream_name ? 0 : c->src_prio + 10);
 	props = pw_properties_new(PW_KEY_MEDIA_CLASS, "Video/Source",
 				  PW_KEY_MEDIA_ROLE, "Camera",
 				  PW_KEY_MEDIA_TYPE, "Video",
@@ -684,12 +845,13 @@ static int cam_publish(struct cam *c)
 				  PW_KEY_NODE_NICK, c->src_nick,
 				  PW_KEY_PRIORITY_SESSION, prio,
 				  OWN_PROP, "output", NULL);
+	effect_capabilities(c, props);
 	c->out = pw_stream_new(c->app->core, "camera-denoise", props);
 	if (!c->out)
 		return -errno;
 	pw_stream_add_listener(c->out, &c->out_listener, &out_events, c);
 	fprintf(stderr, "camera-denoise: publishing %s for %s (%d formats)\n", name,
-		c->src_name, n);
+		c->src_name, nformats);
 	return pw_stream_connect(c->out, PW_DIRECTION_OUTPUT, PW_ID_ANY,
 				 PW_STREAM_FLAG_DRIVER | PW_STREAM_FLAG_MAP_BUFFERS,
 				 params, (uint32_t)n);
@@ -836,8 +998,9 @@ static void on_global(void *data, uint32_t id, uint32_t perms, const char *type,
 	cls = spa_dict_lookup(props, PW_KEY_MEDIA_CLASS);
 	if (!cls || strcmp(cls, "Video/Source") || spa_dict_lookup(props, OWN_PROP))
 		return;
-	/* no temporal filter, nothing to decide on and not forced on: leave cameras alone */
-	if (!a->cfg.temporal && a->cfg.mode != CDN_MODE_ON && !a->cfg.trig.enter_gain &&
+	/* no temporal filter, no session, nothing to decide on and not forced on:
+	 * leave cameras alone */
+	if (!a->stream_name && !a->cfg.temporal && a->cfg.mode != CDN_MODE_ON && !a->cfg.trig.enter_gain &&
 	    a->cfg.trig.enter_noise <= 0) {
 		static bool said;
 		if (!said)
@@ -893,8 +1056,25 @@ static void on_signal(void *data, int sig)
 		if (load_config(a) == 0)
 			spa_list_for_each(c, &a->cams, link) {
 				cdn_trigger_init(&c->trig, &a->cfg.trig, a->cfg.mode);
-				if (c->have_fmt)
+				if (!a->cfg.framing.supported) c->effect_cfg.framing = 0;
+				if (c->effect_cfg.zoom != 0 && (c->effect_cfg.zoom < a->cfg.framing.minimum ||
+					c->effect_cfg.zoom > a->cfg.framing.maximum)) c->effect_cfg.zoom = 0;
+				if (c->out) {
+					struct pw_properties *caps = pw_properties_new(NULL, NULL);
+					if (caps) {
+						effect_capabilities(c, caps);
+						pw_stream_update_properties(c->out, &caps->dict);
+						pw_properties_free(caps);
+					}
+					uint8_t buffer[2048];
+					struct spa_pod_builder builder = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
+					const struct spa_pod *props = effect_props(c, &builder);
+					pw_stream_update_params(c->out, &props, 1);
+				}
+				if (c->have_fmt) {
 					setup_backend(c);
+					setup_effects(c);
+				}
 			}
 		return;
 	}
@@ -906,7 +1086,7 @@ static void usage(void)
 	fprintf(stderr,
 		"usage: aurora-camera-denoise [--mode auto|on|off] [--backend auto|cpu|NAME]\n"
 		"                             [--temporal-backend auto|cpu|gpu]\n"
-		"                             [--boards FILE] [--verbose] [--print-config]\n");
+		"                             [--boards FILE] [--config FILE] [--stream NAME] [--verbose] [--print-config]\n");
 }
 
 int main(int argc, char **argv)
@@ -916,6 +1096,8 @@ int main(int argc, char **argv)
 		{ "backend", required_argument, NULL, 'b' },
 		{ "temporal-backend", required_argument, NULL, 't' },
 		{ "boards", required_argument, NULL, 'B' },
+		{ "config", required_argument, NULL, 'c' },
+		{ "stream", required_argument, NULL, 's' },
 		{ "verbose", no_argument, NULL, 'v' },
 		{ "print-config", no_argument, NULL, 'p' },
 		{ "help", no_argument, NULL, 'h' },
@@ -925,12 +1107,19 @@ int main(int argc, char **argv)
 	bool print_only = false;
 	int o;
 
-	while ((o = getopt_long(argc, argv, "m:b:t:B:vph", opts, NULL)) != -1) {
+	while ((o = getopt_long(argc, argv, "m:b:t:B:c:s:vph", opts, NULL)) != -1) {
 		switch (o) {
 		case 'm': a.cli_mode = optarg; break;
 		case 'b': a.cli_backend = optarg; break;
 		case 't': a.cli_temporal_backend = optarg; break;
 		case 'B': a.boards_path = optarg; break;
+		case 'c': a.cli_config = optarg; break;
+		case 's':
+			if (!*optarg || strlen(optarg) > 48 || strspn(optarg, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-") != strlen(optarg)) {
+				fprintf(stderr, "camera-effects: stream name needs 1-48 letters, digits, _ or -\n");
+				return 2;
+			}
+			a.stream_name = optarg; break;
 		case 'v': a.verbose = true; break;
 		case 'p': print_only = true; break;
 		default: usage(); return o == 'h' ? 0 : 2;

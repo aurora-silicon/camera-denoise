@@ -24,7 +24,7 @@ add_project_arguments(
   language : 'c')
 
 core = static_library('cdn-core',
-  'src/backend.c', 'src/cpu/denoise_cpu.c', 'src/trigger.c', 'src/config.c', 'src/gain.c',
+  'src/backend.c', 'src/cpu/denoise_cpu.c', 'src/trigger.c', 'src/config.c', 'src/gain.c', 'src/effects.c',
   dependencies : [threads, dl, m])
 core_dep = declare_dependency(link_with : core, dependencies : [threads, dl, m])
 
@@ -66,8 +66,9 @@ endif
 
 pipewire = dependency('libpipewire-0.3', version : '>= 1.0', required : get_option('daemon'))
 if pipewire.found()
-  executable('aurora-camera-denoise', 'src/main.c', 'src/pipewire-frame.c',
+  daemon = executable('aurora-camera-denoise', 'src/main.c', 'src/pipewire-frame.c',
     dependencies : [core_dep, pipewire], install : true)
+  test('session-config', find_program('tests/check-session-config.sh'), args : [daemon])
   test('buffers', executable('test_buffers', 'tests/test_buffers.c', 'src/pipewire-frame.c',
     dependencies : [core_dep, pipewire]))
   test('formats', executable('test_formats', 'tests/test_formats.c', 'src/pipewire-frame.c',
@@ -101,3 +102,5 @@ test('cpu', executable('test_cpu', 'tests/test_cpu.c', dependencies : core_dep))
 test('trigger', executable('test_trigger', 'tests/test_trigger.c', dependencies : core_dep))
 test('config', executable('test_config', 'tests/test_config.c', dependencies : core_dep),
   args : [meson.current_build_dir()])
+
+test('effects', executable('test_effects', 'tests/test_effects.c', dependencies : core_dep))

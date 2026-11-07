@@ -6,7 +6,13 @@
 
 #include "trigger.h"
 
+struct cdn_framing_cfg {
+	bool supported;
+	float minimum, maximum, default_zoom;
+};
+
 struct cdn_config {
+	struct cdn_framing_cfg framing;
 	struct cdn_trigger_cfg trig;
 	enum cdn_mode mode;
 	/*

@@ -35,6 +35,7 @@ int main(int argc, char **argv)
 	CHECK(cdn_config_load(&c, compat, boards, NULL, 0) == 0);
 	CHECK(!strcmp(c.board, "apple,j700"));
 	CHECK(c.trig.enter_gain == 2304 && c.trig.exit_gain == 1792);
+	CHECK(!c.framing.supported);
 	CHECK(c.mode == CDN_MODE_AUTO && !strcmp(c.backend, "auto"));
 	CHECK(c.temporal);
 	CHECK(c.low_light_frame_rate);
@@ -53,6 +54,17 @@ int main(int argc, char **argv)
 	CHECK(!c.low_light_frame_rate);
 	CHECK(c.trig.enter_gain == 2304 && c.trig.exit_gain == 1500);
 
+	/* Digital framing is a user opt-in, not a packaged board capability. */
+	f = fopen(user, "a");
+	fputs("framing-supported = true\nframing-zoom-min = 1\nframing-zoom-max = 6\nframing-zoom-default = 1.5\n", f);
+	fclose(f);
+	CHECK(cdn_config_load(&c, compat, boards, s1, 2) == 0);
+	CHECK(c.framing.supported && c.framing.default_zoom == 1.5f);
+	CHECK(cdn_config_load(&c, compat, boards, NULL, 0) == 0);
+	CHECK(!c.framing.supported);
+	f = fopen(user, "a"); fputs("framing-zoom-default = 7\n", f); fclose(f);
+	CHECK(cdn_config_load(&c, compat, boards, s1, 2) != 0);
+
 	f = fopen(user, "w");
 	fputs("[denoise]\ntemporal-backend = gpu\n", f);
 	fclose(f);
@@ -70,6 +82,29 @@ int main(int argc, char **argv)
 	CHECK(cdn_config_load(&c, "/nonexistent", boards, NULL, 0) == 0);
 	CHECK(c.board[0] == 0 && c.trig.enter_gain == 0 && c.temporal);
 
+    f = fopen(boards, "a");
+    fputs("framing-supported = true\nframing-zoom-min = 1\nframing-zoom-max = 6\nframing-zoom-default = 1.5\n", f);
+    fclose(f);
+    CHECK(cdn_config_load(&c, compat, boards, NULL, 0) == 0);
+    CHECK(c.framing.supported && c.framing.minimum == 1 && c.framing.maximum == 6 && c.framing.default_zoom == 1.5f);
+    f = fopen(boards, "a"); fputs("framing-zoom-default = 7\n", f); fclose(f);
+    CHECK(cdn_config_load(&c, compat, boards, NULL, 0) != 0);
+	/* A user may opt in to framing on a board without framing data. */
+	{
+		char optin[512];
+		snprintf(optin, sizeof(optin), "%s/framing-optin.conf", dir);
+		f = fopen(optin, "w");
+		fputs("[denoise]\nframing-supported = true\nframing-zoom-min = 1\nframing-zoom-max = 2\nframing-zoom-default = 1\n", f);
+		fclose(f);
+		f = fopen(boards, "w"); fputs("[apple,j700]\nenter-gain = 2304\n", f); fclose(f);
+		const char *s3[] = { optin };
+		CHECK(cdn_config_load(&c, compat, boards, NULL, 0) == 0 && !c.framing.supported);
+		CHECK(cdn_config_load(&c, compat, boards, s3, 1) == 0);
+		CHECK(c.framing.supported && c.framing.minimum == 1 && c.framing.maximum == 2 && c.framing.default_zoom == 1);
+		f = fopen(optin, "a"); fputs("framing-zoom-max = 9\n", f); fclose(f);
+		CHECK(cdn_config_load(&c, compat, boards, s3, 1) != 0);
+		remove(optin);
+	}
 	remove(compat); remove(boards); remove(user); remove(bad);
 	printf(fails ? "FAIL\n" : "PASS\n");
 	return fails != 0;
