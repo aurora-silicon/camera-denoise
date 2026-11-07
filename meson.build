@@ -71,6 +71,8 @@ if pipewire.found()
   test('session-config', find_program('tests/check-session-config.sh'), args : [daemon])
   test('buffers', executable('test_buffers', 'tests/test_buffers.c', 'src/pipewire-frame.c',
     dependencies : [core_dep, pipewire]))
+  test('formats', executable('test_formats', 'tests/test_formats.c', 'src/pipewire-frame.c',
+    dependencies : [core_dep, pipewire]))
 endif
 
 executable('aurora-camera-denoise-bench', 'tools/cdn-bench.c',
