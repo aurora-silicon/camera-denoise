@@ -92,10 +92,11 @@ if unitdir == ''
     get_option('prefix') / 'lib' / 'systemd' / 'user'
 endif
 if pipewire.found()
-  configure_file(input : 'data/aurora-camera-denoise.service.in',
+  user_unit = configure_file(input : 'data/aurora-camera-denoise.service.in',
     output : 'aurora-camera-denoise.service',
     configuration : {'bindir' : get_option('prefix') / get_option('bindir')},
     install_dir : unitdir)
+  test('user-unit', find_program('sh'), args : [files('tests/check-unit.sh'), user_unit])
 endif
 
 test('cpu', executable('test_cpu', 'tests/test_cpu.c', dependencies : core_dep))
