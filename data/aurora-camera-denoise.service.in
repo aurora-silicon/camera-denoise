@@ -3,12 +3,19 @@ Description=Camera denoise filter for built-in cameras
 Documentation=https://github.com/aurora-silicon/camera-denoise
 After=pipewire.service wireplumber.service
 Requires=pipewire.service
+# Only desktop users run a camera session. root's and system users' (greeter)
+# user managers have no PipeWire session to join.
+ConditionUser=!root
+ConditionUser=!@system
+# A PipeWire that is down stays down: give up after 5 tries in a minute.
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 ExecStart=@bindir@/aurora-camera-denoise
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
-RestartSec=2
+RestartSec=5
 
 [Install]
 WantedBy=pipewire.service
