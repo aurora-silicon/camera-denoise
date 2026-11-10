@@ -96,7 +96,7 @@ if pipewire.found()
     output : 'aurora-camera-denoise.service',
     configuration : {'bindir' : get_option('prefix') / get_option('bindir')},
     install_dir : unitdir)
-  test('user-unit', find_program('tests/check-unit.sh'), args : [user_unit])
+  test('user-unit', find_program('sh'), args : [files('tests/check-unit.sh'), user_unit])
 endif
 
 test('cpu', executable('test_cpu', 'tests/test_cpu.c', dependencies : core_dep))
