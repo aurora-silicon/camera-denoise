@@ -83,6 +83,18 @@ if host_machine.system() == 'linux' and cc.has_header('linux/videodev2.h')
     install : true, install_dir : backenddir)
 endif
 
+# The Neural Engine low-light backend (accel/ane ABI 3, H16G programs from
+# data/ane), loaded as a plugin. Needs _Float16.
+if host_machine.system() == 'linux' and cc.compiles('_Float16 h = 1.0f; int main(void) { return (int)h - 1; }',
+                                                    name : '_Float16')
+  ane = shared_module('cdn-backend-ane', 'src/ane/backend_ane.c',
+    name_prefix : '', gnu_symbol_visibility : 'hidden',
+    install : true, install_dir : backenddir)
+  test('ane', executable('test_ane', 'tests/test_ane.c', dependencies : core_dep),
+    args : [ane.full_path(), meson.current_build_dir()])
+  install_subdir('data/ane', install_dir : pkgdatadir, exclude_files : ['weights.bin'])
+endif
+
 executable('aurora-camera-denoise-bench', 'tools/cdn-bench.c',
   dependencies : core_dep, install : true)
 executable('aurora-camera-denoise-compare', 'tools/cdn-compare.c',
