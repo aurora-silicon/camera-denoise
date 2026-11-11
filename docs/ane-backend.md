@@ -26,11 +26,17 @@ With `backend = auto` (the default) the filter tries each name in `prefer` (defa
 
 returning an ops table with `abi = CDN_BACKEND_ABI`. `backend = ane` forces it, `backend = cpu` skips it. The plugin is its own package, so the filter never links the Neural Engine runtime.
 
-## What the ANE backend has to do
+## The ANE backend
 
-1. In `create`, open the shared Neural Engine runtime, pick the compiled model for the machine's generation and the frame size (or 64x64-class tiles with a halo, until the compiler tiles full frames), and keep the program resident.
-2. In `process`, convert NV12 to the model's input layout (luma plus upsampled chroma, or luma only with the CPU chroma passes), run it, convert back, blend by `strength`.
-3. Keep the previous output or frames for a temporal model (FastDVDnet class) and clear them in `reset`.
-4. Return NULL from `create` on machines whose Neural Engine Linux cannot drive yet. On the MacBook Neo that is every machine today, so the Neo keeps the CPU path.
+`cdn-backend-ane.so` (src/ane/backend_ane.c) runs a small open CNN on the luma plane:
 
-The same open weights should also run on the CPU through the same plugin, so results match whichever unit runs them.
+- The network works on the 2x2 space-to-depth grid of the frame, so a 1920x1080 frame is 4 planes of 960x540 (plane c holds pixel (2y + c/2, 2x + c%2)). Layers: 1x1 4->32, depthwise 3x3, 1x1 32->32, 3x3 32->32, depthwise 3x3, 1x1 32->16, ReLU after all but the last. Output planes 0-3 are a residual; the result is `in + strength * residual`. Chroma passes through.
+- The host does the space-to-depth, the residual add and the depth-to-space inside the u8/fp16 conversion it needs anyway, so the program on the ANE is only the six convolutions.
+- The program is built by our ANE compiler ([mil-hwx-compiler](https://github.com/aurora-silicon/mil-hwx-compiler), H16G) with `tools/ane/build-model.py` from `data/ane/weights.bin`. It lives in `<datadir>/aurora-camera-denoise/ane/h16g-<W>x<H>/` with the four load sections the Linux driver (accel/ane, ABI 3) needs. `CDN_ANE_MODEL_DIR` points elsewhere for testing.
+- `create` returns NULL without an H16 ANE node, without a program for the grid size (only 960x540 ships), or when the load fails; the filter then keeps the temporal stage alone.
+
+The weights were trained on our own camera clips from a MacBook Neo: inputs are single frames and the temporal filter's output, the target is the clip's mean over 60 frames, moving areas are masked out. On held-out frames of those clips, static areas improve from 32.7 to 38.7 dB PSNR after the temporal stage and from 29.7 to 37.9 dB on raw frames. That is two clips of one dim scene, so more scenes are the next step.
+
+On the MacBook Pro (M4 Pro) the program runs a 960x540 grid in 3.8 ms of ANE time. Through `aurora-camera-denoise-bench` on 1080p frames the plugin's output is within one code value of a CPU reference of the same network (98% exact). Paced at 30 fps it costs 10.2 ms of CPU per frame and 14.3 ms of latency, most of it the driver copying the 4 MB input and the 16 MB output of each request; the unpaced cost is 1.9 ms per frame. The stage only runs above the board's low-light levels.
+
+M1/M2 (H13/H14) and the MacBook Neo (H17) have no program yet; on them `create` returns NULL.
