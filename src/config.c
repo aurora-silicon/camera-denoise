@@ -70,7 +70,7 @@ static int set_key(struct cdn_config *c, const char *k, const char *v, bool sett
 		else return -1;
 	}
 	else if (settings && !strcmp(k, "temporal-backend")) {
-		if (strcmp(v, "auto") && strcmp(v, "cpu") && strcmp(v, "gpu"))
+		if (strcmp(v, "auto") && strcmp(v, "cpu") && strcmp(v, "gpu") && strcmp(v, "ave"))
 			return -1;
 		snprintf(c->temporal_backend, sizeof(c->temporal_backend), "%s", v);
 	}
@@ -172,7 +172,9 @@ const char *cdn_temporal_backend(const struct cdn_config *c)
 	/* backend = cpu is the all-CPU baseline for measurements */
 	if (!strcmp(c->backend, "cpu"))
 		return "cpu";
-	return !strcmp(c->temporal_backend, "gpu") ? "gpu" : "cpu";
+	if (!strcmp(c->temporal_backend, "gpu") || !strcmp(c->temporal_backend, "ave"))
+		return c->temporal_backend;
+	return "cpu";
 }
 
 void cdn_config_print(const struct cdn_config *c)

@@ -175,7 +175,7 @@ static int load_config(struct app *a)
 		snprintf(next.backend, sizeof(next.backend), "%s", a->cli_backend);
 	if (a->cli_temporal_backend) {
 		const char *t = a->cli_temporal_backend;
-		if (strcmp(t, "auto") && strcmp(t, "cpu") && strcmp(t, "gpu")) {
+		if (strcmp(t, "auto") && strcmp(t, "cpu") && strcmp(t, "gpu") && strcmp(t, "ave")) {
 			fprintf(stderr, "camera-denoise: bad --temporal-backend %s\n", t);
 			return -1;
 		}
@@ -1085,7 +1085,7 @@ static void usage(void)
 {
 	fprintf(stderr,
 		"usage: aurora-camera-denoise [--mode auto|on|off] [--backend auto|cpu|NAME]\n"
-		"                             [--temporal-backend auto|cpu|gpu]\n"
+		"                             [--temporal-backend auto|cpu|gpu|ave]\n"
 		"                             [--boards FILE] [--config FILE] [--stream NAME] [--verbose] [--print-config]\n");
 }
 
