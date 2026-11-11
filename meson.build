@@ -75,6 +75,14 @@ if pipewire.found()
     dependencies : [core_dep, pipewire]))
 endif
 
+# The encoder MCTF temporal backend (V4L2 mem2mem, with the scaler's
+# lossless form when it has one), loaded as a plugin.
+if host_machine.system() == 'linux' and cc.has_header('linux/videodev2.h')
+  shared_module('cdn-backend-ave', 'src/ave/backend_ave.c',
+    name_prefix : '', gnu_symbol_visibility : 'hidden',
+    install : true, install_dir : backenddir)
+endif
+
 executable('aurora-camera-denoise-bench', 'tools/cdn-bench.c',
   dependencies : core_dep, install : true)
 executable('aurora-camera-denoise-compare', 'tools/cdn-compare.c',

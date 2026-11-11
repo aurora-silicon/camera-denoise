@@ -44,6 +44,9 @@ int main(int argc, char **argv)
 	CHECK(!strcmp(cdn_temporal_backend(&c), "cpu"));
 	snprintf(c.temporal_backend, sizeof(c.temporal_backend), "gpu");
 	CHECK(!strcmp(cdn_temporal_backend(&c), "gpu"));
+	snprintf(c.temporal_backend, sizeof(c.temporal_backend), "ave");
+	CHECK(!strcmp(cdn_temporal_backend(&c), "ave"));
+	snprintf(c.temporal_backend, sizeof(c.temporal_backend), "gpu");
 	snprintf(c.backend, sizeof(c.backend), "cpu");
 	CHECK(!strcmp(cdn_temporal_backend(&c), "cpu"));
 
