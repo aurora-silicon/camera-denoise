@@ -12,8 +12,10 @@
  * MIL and weights in tools/ane/, with the four host-built H16 load sections
  * next to it, one directory per ANE generation and grid size:
  *   <datadir>/aurora-camera-denoise/ane/<h16g|h17>-<W>x<H>/
- * The Linux ANE driver (accel/ane, ABI 3) loads it; EXECUTE copies the input
- * in and the output out. Where there is no ANE node, no program for the
+ * The Linux ANE driver (accel/ane, ABI 3) loads it. Where the driver maps
+ * the program's surfaces, the frame is converted straight into the input
+ * surface and the residual read straight from the first four planes of the
+ * output, and requests run in place; otherwise EXECUTE copies both ways. Where there is no ANE node, no program for the
  * frame size or the load fails, create() returns NULL and the filter keeps
  * the temporal stage alone.
  */
@@ -26,6 +28,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -69,6 +72,9 @@ struct ane_h16_exec {
 #define ANE_IOCTL_GET_CAPS _IOWR('d', 0x40 + 0x00, struct ane_get_caps)
 #define ANE_IOCTL_H16_LOAD _IOWR('d', 0x40 + 0x07, struct ane_h16_load)
 #define ANE_IOCTL_H16_EXEC _IOW('d', 0x40 + 0x08, struct ane_h16_exec)
+/* accel minor 1: map the program's surfaces and run on them in place */
+#define ANE_H16_MMAP_OFFSET(i) ((off_t)((uint64_t)((i) + 1) << 32))
+#define ANE_H16_EXEC_IN_PLACE 1u
 
 /* the network: 4 grid planes in, 16 planes out (the first 4 are the residual) */
 #define IN_PLANES 4
@@ -84,6 +90,9 @@ struct ane {
 	size_t row;		/* fp16 surface row bytes, 64-aligned */
 	_Float16 *in, *out;
 	size_t in_size, out_size;
+	/* in and out are the driver's surfaces, mapped (lengths in_map, out_map) */
+	bool mapped;
+	size_t in_map, out_map;
 	_Float16 lut[256];	/* u8 code -> fp16 in [0, 1] */
 };
 
@@ -143,10 +152,15 @@ static void ane_destroy(void *state)
 
 	if (!a)
 		return;
+	if (a->mapped) {
+		munmap(a->in, a->in_map);
+		munmap(a->out, a->out_map);
+	} else {
+		free(a->in);
+		free(a->out);
+	}
 	if (a->fd >= 0)
 		close(a->fd);
-	free(a->in);
-	free(a->out);
 	free(a);
 }
 
@@ -202,10 +216,32 @@ static void *ane_create(int width, int height, int threads)
 		fprintf(stderr, "camera-denoise: ane: %s does not fit %dx%d\n", dir, width, height);
 		goto out;
 	}
-	a->in = aligned_alloc(64, (a->in_size + 63) & ~(size_t)63);
-	a->out = aligned_alloc(64, (a->out_size + 63) & ~(size_t)63);
-	if (!a->in || !a->out)
-		goto out;
+	if (!getenv("CDN_ANE_COPY")) {
+		long page = sysconf(_SC_PAGESIZE);
+		/* only the residual planes of the output are read */
+		size_t used = (size_t)IN_PLANES * a->row * a->gh;
+		void *in, *out;
+
+		a->in_map = (a->in_size + page - 1) & ~(size_t)(page - 1);
+		a->out_map = (used + page - 1) & ~(size_t)(page - 1);
+		in = mmap(NULL, a->in_map, PROT_READ | PROT_WRITE, MAP_SHARED, a->fd, ANE_H16_MMAP_OFFSET(0));
+		out = in == MAP_FAILED ? MAP_FAILED :
+			mmap(NULL, a->out_map, PROT_READ, MAP_SHARED, a->fd, ANE_H16_MMAP_OFFSET(1));
+		if (out != MAP_FAILED) {
+			a->in = in;
+			a->out = out;
+			a->mapped = true;
+			fprintf(stderr, "camera-denoise: ane: %s: running in place on the mapped surfaces\n", dir);
+		} else if (in != MAP_FAILED) {
+			munmap(in, a->in_map);
+		}
+	}
+	if (!a->mapped) {
+		a->in = aligned_alloc(64, (a->in_size + 63) & ~(size_t)63);
+		a->out = aligned_alloc(64, (a->out_size + 63) & ~(size_t)63);
+		if (!a->in || !a->out)
+			goto out;
+	}
 	memset(a->in, 0, a->in_size);
 	for (int i = 0; i < 256; i++)
 		a->lut[i] = (_Float16)(i / 255.0f);
@@ -236,6 +272,9 @@ static int ane_process(void *state, const struct cdn_frame *in, struct cdn_frame
 		{ (uint64_t)(uintptr_t)a->out, a->out_size },
 	};
 	struct ane_h16_exec exec = { (uint64_t)(uintptr_t)bufs, 2, 0 };
+
+	if (a->mapped)
+		exec = (struct ane_h16_exec){ 0, 2, ANE_H16_EXEC_IN_PLACE };
 
 	(void)info;
 	if (in->width != 2 * a->gw || in->height != 2 * a->gh)
