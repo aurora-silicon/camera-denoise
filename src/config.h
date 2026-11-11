@@ -51,6 +51,9 @@ int cdn_config_load(struct cdn_config *c, const char *compat_path,
 
 /* The plugin the temporal stage runs on: "cpu" or "gpu" */
 const char *cdn_temporal_backend(const struct cdn_config *c);
+/* true when the temporal backend was picked by auto (keep it only if it
+ * runs its full hardware path) */
+bool cdn_temporal_auto(const struct cdn_config *c);
 
 void cdn_config_print(const struct cdn_config *c);
 

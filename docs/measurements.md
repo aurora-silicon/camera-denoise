@@ -43,3 +43,16 @@ Live, in the PipeWire filter at 30 fps, the governor runs it at low clocks (1.26
 The filter adds that processing time as latency and no frames, since the temporal filter only looks back.
 
 Four threads on the J616s cut a frame to 1.2 ms for about 15% more CPU time (3.5 ms). One thread stays the default since it costs the least, `threads = 4` trades a little CPU for latency.
+
+## Video encoder filter
+
+`temporal-backend = auto` on the MacBook Neo (fleet kernel with the AVE MCTF device and the scaler's lossless form). `aurora-camera-denoise-bench` paced at 30 fps over a 60-frame 1080p camera clip, 180 s per run, system power from the SMC power sensor (hwmon), screen on, same boot:
+
+| Run | System power | Above idle | CPU at 30 fps |
+| --- | --- | --- | --- |
+| idle | 6.249 W | | |
+| NEON (`cpu`) | 6.740 W | +0.49 W | 38.7% of one core (12.9 ms per frame) |
+| MCTF plugin (`ave`) | 6.581 W | +0.33 W | 4.1% (1.36 ms per frame) |
+| MCTF chain alone | 6.504 W | +0.26 W | 0.17 ms per frame in the process |
+
+The baseline dropped by about 1.8 W later in the session, so a second pair is compared on its own: idle 4.419 W, `ave` 4.720 W (+0.30 W, 3.7%). The plugin's output is bit-exact with macOS 26.6.2 VideoToolbox's temporal noise filter at strength 1.0 on the same frames, at 15 ms latency.

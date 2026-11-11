@@ -174,7 +174,16 @@ const char *cdn_temporal_backend(const struct cdn_config *c)
 		return "cpu";
 	if (!strcmp(c->temporal_backend, "gpu") || !strcmp(c->temporal_backend, "ave"))
 		return c->temporal_backend;
+	/* auto: the video encoder's filter where it runs fully in hardware
+	 * (macOS's output at a fraction of the CPU energy), else the CPU */
+	if (!strcmp(c->temporal_backend, "auto"))
+		return "ave";
 	return "cpu";
+}
+
+bool cdn_temporal_auto(const struct cdn_config *c)
+{
+	return !strcmp(c->temporal_backend, "auto") && strcmp(c->backend, "cpu");
 }
 
 void cdn_config_print(const struct cdn_config *c)
@@ -184,7 +193,7 @@ void cdn_config_print(const struct cdn_config *c)
 		"backend %s (prefer %s), "
 		"enter gain >= %u, exit < %u, noise %.2f/%.2f, fps <= %.0f, ramp %d/%d frames\n",
 		*c->board ? c->board : "(no board data)", cdn_mode_name(c->mode),
-		c->temporal ? "on" : "off", cdn_temporal_backend(c), c->low_light_frame_rate ? "on" : "off", c->backend,
+		c->temporal ? "on" : "off", cdn_temporal_auto(c) ? "auto" : cdn_temporal_backend(c), c->low_light_frame_rate ? "on" : "off", c->backend,
 		c->prefer, c->trig.enter_gain, c->trig.exit_gain, c->trig.enter_noise,
 		c->trig.exit_noise, c->trig.fps_threshold, c->trig.ramp_up_frames,
 		c->trig.ramp_down_frames);

@@ -463,6 +463,15 @@ static const struct cdn_backend_ops ops = {
 	.destroy = ave_destroy,
 };
 
+/* auto keeps the all-hardware chain only: on NV12 the MCTF driver
+ * converts on the CPU and the output is not macOS's. */
+__attribute__((visibility("default"))) int cdn_backend_query(void *state, uint32_t what)
+{
+	struct ave *a = state;
+
+	return what == CDN_QUERY_AUTO ? a->chain : -EINVAL;
+}
+
 __attribute__((visibility("default"))) const struct cdn_backend_ops *cdn_backend_entry(void)
 {
 	return &ops;

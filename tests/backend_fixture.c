@@ -22,4 +22,5 @@ static int dmabuf(void *s, const struct cdn_dmabuf *i, struct cdn_frame *o,
 static const struct cdn_backend_dmabuf_ops ext = {
 	.abi=CDN_DMABUF_ABI, .flags=CDN_BACKEND_SINGLE_UPLOAD, .process=dmabuf };
 const struct cdn_backend_dmabuf_ops *cdn_backend_dmabuf_entry(void) { return &ext; }
+int cdn_backend_query(void *s, uint32_t what) { return s == &token && what == CDN_QUERY_AUTO; }
 #endif

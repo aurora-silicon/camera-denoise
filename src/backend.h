@@ -97,6 +97,16 @@ struct cdn_backend_dmabuf_ops {
 typedef const struct cdn_backend_dmabuf_ops *(*cdn_backend_dmabuf_entry_fn)(void);
 const struct cdn_backend_dmabuf_ops *cdn_backend_dmabuf(const struct cdn_backend_ops *ops);
 
+/* Optional ABI v1 companion symbol: answers questions about one instance.
+ * Returns 1 for yes, 0 for no, negative for unknown questions. */
+#define CDN_QUERY_ENTRY "cdn_backend_query"
+/* Yes when this instance runs the backend's full hardware path, so
+ * temporal-backend = auto may keep it instead of the CPU. */
+#define CDN_QUERY_AUTO 1u
+typedef int (*cdn_backend_query_fn)(void *state, uint32_t what);
+/* The plugin's answer, or 0 when it has no query symbol (and for the CPU). */
+int cdn_backend_ask(const struct cdn_backend_ops *ops, void *state, uint32_t what);
+
 /* The built-in CPU backend (temporal + spatial, NEON on arm64). */
 const struct cdn_backend_ops *cdn_cpu_backend(void);
 

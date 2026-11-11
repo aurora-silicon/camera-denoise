@@ -39,15 +39,20 @@ int main(int argc, char **argv)
 	CHECK(c.mode == CDN_MODE_AUTO && !strcmp(c.backend, "auto"));
 	CHECK(c.temporal);
 	CHECK(c.low_light_frame_rate);
-	/* the GPU temporal path costs more energy than the CPU one: opt-in only */
+	/* auto tries the encoder's filter (kept only on its full hardware
+	 * path); the GPU costs more energy than the CPU, so it is opt-in */
 	CHECK(!strcmp(c.temporal_backend, "auto"));
-	CHECK(!strcmp(cdn_temporal_backend(&c), "cpu"));
+	CHECK(!strcmp(cdn_temporal_backend(&c), "ave") && cdn_temporal_auto(&c));
 	snprintf(c.temporal_backend, sizeof(c.temporal_backend), "gpu");
-	CHECK(!strcmp(cdn_temporal_backend(&c), "gpu"));
+	CHECK(!strcmp(cdn_temporal_backend(&c), "gpu") && !cdn_temporal_auto(&c));
 	snprintf(c.temporal_backend, sizeof(c.temporal_backend), "ave");
-	CHECK(!strcmp(cdn_temporal_backend(&c), "ave"));
-	snprintf(c.temporal_backend, sizeof(c.temporal_backend), "gpu");
+	CHECK(!strcmp(cdn_temporal_backend(&c), "ave") && !cdn_temporal_auto(&c));
+	snprintf(c.temporal_backend, sizeof(c.temporal_backend), "cpu");
+	CHECK(!strcmp(cdn_temporal_backend(&c), "cpu") && !cdn_temporal_auto(&c));
+	snprintf(c.temporal_backend, sizeof(c.temporal_backend), "auto");
 	snprintf(c.backend, sizeof(c.backend), "cpu");
+	CHECK(!strcmp(cdn_temporal_backend(&c), "cpu") && !cdn_temporal_auto(&c));
+	snprintf(c.temporal_backend, sizeof(c.temporal_backend), "gpu");
 	CHECK(!strcmp(cdn_temporal_backend(&c), "cpu"));
 
 	const char *s1[] = { "/nonexistent", user };
