@@ -30,6 +30,10 @@ int main(int argc, char **argv)
 	const struct cdn_backend_dmabuf_ops *ext=cdn_backend_dmabuf(ops);
 	CHECK(ext && ext->abi==CDN_DMABUF_ABI && ext->process);
 	CHECK(ext->flags & CDN_BACKEND_SINGLE_UPLOAD);
+	void *st=ops->create(64,64,0);
+	CHECK(st && cdn_backend_ask(ops,st,CDN_QUERY_AUTO)==1);
+	CHECK(cdn_backend_ask(ops,st,99)==0);
+	ops->destroy(st);
 	unlink(path);
 	// Bad ABI is rejected and closed; replacing it can be retried.
 	snprintf(path,sizeof(path),"%s/cdn-backend-retry.so",dir);
@@ -43,6 +47,11 @@ int main(int argc, char **argv)
 	CHECK(!copy(argv[4],path));
 	ops=cdn_backend_find("legacy",NULL);
 	CHECK(ops && !cdn_backend_dmabuf(ops));
+	// Without the query symbol, auto does not keep a plugin.
+	st=ops->create(64,64,0);
+	CHECK(st && cdn_backend_ask(ops,st,CDN_QUERY_AUTO)==0);
+	ops->destroy(st);
+	CHECK(cdn_backend_ask(cdn_cpu_backend(),NULL,CDN_QUERY_AUTO)==0);
 	CHECK(cdn_backend_find("auto","absent,cpu")==cdn_cpu_backend());
 	CHECK(!cdn_backend_find("../bad",NULL));
 	unlink(path); rmdir(dir);

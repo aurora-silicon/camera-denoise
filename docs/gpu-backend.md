@@ -5,7 +5,7 @@ It needs no display server or window surface. Honeykrisp/Borealis use the
 same shaders on G13/G14/G16/G17; actual driver/device validation is recorded
 separately below. The temporal stage stays on the CPU unless you ask for
 the GPU with `temporal-backend = gpu` in `denoise.conf` or
-`--temporal-backend gpu`. `auto` means CPU for now, because on the Neo this
+`--temporal-backend gpu`. `auto` never picks it, because on the Neo this
 path costs about 3.3 times the CPU path's energy (see below). With the GPU
 asked for, a missing plugin or device or a processing error falls back to
 CPU. Processing failure recreates CPU history, so its first frame passes

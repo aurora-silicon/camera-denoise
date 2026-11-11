@@ -685,10 +685,16 @@ static void setup_backend(struct cam *c)
 	c->ml_ops = NULL;
 
 	if (cfg->temporal) {
-		/* CPU temporal unless the GPU is asked for, with the low-light
-		 * plugin gated on its own. */
+		/* The configured temporal backend, else the CPU; auto keeps the
+		 * encoder's filter only on its full hardware path. The low-light
+		 * plugin is gated on its own. */
 		c->ops = cdn_backend_find(cdn_temporal_backend(cfg), NULL);
 		if (c->ops) c->bstate = c->ops->create(w, h, cfg->threads);
+		if (c->bstate && c->ops != cdn_cpu_backend() && cdn_temporal_auto(cfg) &&
+		    cdn_backend_ask(c->ops, c->bstate, CDN_QUERY_AUTO) != 1) {
+			c->ops->destroy(c->bstate);
+			c->bstate = NULL;
+		}
 		if (!c->bstate) {
 			c->ops = cdn_cpu_backend();
 			c->bstate = c->ops->create(w, h, cfg->threads);

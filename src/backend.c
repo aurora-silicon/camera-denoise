@@ -27,6 +27,7 @@ static struct plugin {
 	char name[65];
 	const struct cdn_backend_ops *ops;
 	const struct cdn_backend_dmabuf_ops *dmabuf;
+	cdn_backend_query_fn query;
 } plugins[32];
 static unsigned nplugins;
 
@@ -36,6 +37,14 @@ const struct cdn_backend_dmabuf_ops *cdn_backend_dmabuf(const struct cdn_backend
 		if (plugins[i].ops == ops)
 			return plugins[i].dmabuf;
 	return NULL;
+}
+
+int cdn_backend_ask(const struct cdn_backend_ops *ops, void *state, uint32_t what)
+{
+	for (unsigned i = 0; i < nplugins; i++)
+		if (plugins[i].ops == ops)
+			return plugins[i].query ? plugins[i].query(state, what) : 0;
+	return 0;
 }
 
 static const struct cdn_backend_ops *load_plugin(const char *name)
@@ -77,6 +86,7 @@ static const struct cdn_backend_ops *load_plugin(const char *name)
 	p->dmabuf = dmabuf_entry ? dmabuf_entry() : NULL;
 	if (p->dmabuf && p->dmabuf->abi != CDN_DMABUF_ABI)
 		p->dmabuf = NULL;
+	p->query = (cdn_backend_query_fn)dlsym(dl, CDN_QUERY_ENTRY);
 	/* stays loaded for the life of the process */
 	return ops;
 }
