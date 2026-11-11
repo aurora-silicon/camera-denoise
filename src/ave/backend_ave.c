@@ -34,7 +34,7 @@
 #define CARD "Apple AVE MCTF"
 #define LEVEL_CTRL "MCTF Level"
 #define STRENGTH_CTRL "MCTF Strength"
-/* the session strength macOS's camera daemon starts with (Start +0x26f8) */
+/* the strength macOS starts its built-in camera sessions at */
 #define SESSION_STRENGTH 16
 #define TIMEOUT_MS 200
 
