@@ -23,6 +23,7 @@ static void defaults(struct cdn_config *c)
 	c->strength = 1.0f;
 	c->spatial = 1.0f;
 	c->temporal_frames = 8;
+	cdn_picture_defaults(&c->picture);
 	snprintf(c->backend, sizeof(c->backend), "auto");
 	snprintf(c->prefer, sizeof(c->prefer), "ane");
 	snprintf(c->drivers, sizeof(c->drivers), "apple-isp");
@@ -88,6 +89,13 @@ static int set_key(struct cdn_config *c, const char *k, const char *v, bool sett
 	else if (settings && !strcmp(k, "spatial") && num && d >= 0 && d <= 1) c->spatial = (float)d;
 	else if (settings && !strcmp(k, "temporal-frames") && num && d >= 2 && d <= 8 && d == (int)d)
 		c->temporal_frames = (int)d;
+	else if (settings && !strcmp(k, "vignette") && num && d >= 0 && d <= 1) c->picture.vignette = (float)d;
+	else if (settings && !strcmp(k, "brightness") && num && d >= -1 && d <= 1) c->picture.brightness = (float)d;
+	else if (settings && !strcmp(k, "contrast") && num && d >= 0.5 && d <= 2) c->picture.contrast = (float)d;
+	else if (settings && !strcmp(k, "saturation") && num && d >= 0 && d <= 2) c->picture.saturation = (float)d;
+	else if (settings && !strcmp(k, "warmth") && num && d >= -1 && d <= 1) c->picture.warmth = (float)d;
+	else if (settings && !strcmp(k, "tint") && num && d >= -1 && d <= 1) c->picture.tint = (float)d;
+	else if (settings && !strcmp(k, "sharpen") && num && d >= 0 && d <= 1) c->picture.sharpen = (float)d;
 	else if (settings && !strcmp(k, "drivers")) snprintf(c->drivers, sizeof(c->drivers), "%s", v);
 	else return -1;
 	return 0;
@@ -329,10 +337,13 @@ void cdn_config_print(const struct cdn_config *c)
 		"camera-denoise: board %s, mode %s, temporal %s (%s), low-light frame rate %s, "
 		"backend %s (prefer %s), "
 		"enter gain >= %u, exit < %u, noise %.2f/%.2f, fps <= %.0f, ramp %d/%d frames, "
-		"strength %.2f, spatial %.2f, temporal frames %d\n",
+		"strength %.2f, spatial %.2f, temporal frames %d; picture: vignette %.2f, brightness %.2f, "
+		"contrast %.2f, saturation %.2f, warmth %.2f, tint %.2f, sharpen %.2f\n",
 		*c->board ? c->board : "(no board data)", cdn_mode_name(c->mode),
 		c->temporal ? "on" : "off", cdn_temporal_auto(c) ? "auto" : cdn_temporal_backend(c), c->low_light_frame_rate ? "on" : "off", c->backend,
 		c->prefer, c->trig.enter_gain, c->trig.exit_gain, c->trig.enter_noise,
 		c->trig.exit_noise, c->trig.fps_threshold, c->trig.ramp_up_frames,
-		c->trig.ramp_down_frames, c->strength, c->spatial, c->temporal_frames);
+		c->trig.ramp_down_frames, c->strength, c->spatial, c->temporal_frames,
+		c->picture.vignette, c->picture.brightness, c->picture.contrast, c->picture.saturation,
+		c->picture.warmth, c->picture.tint, c->picture.sharpen);
 }

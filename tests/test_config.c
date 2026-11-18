@@ -105,6 +105,29 @@ int main(int argc, char **argv)
 		}
 	}
 
+	/* the picture keys, and their ranges */
+	f = fopen(user, "w");
+	fputs("[denoise]\nvignette = 0.5\nbrightness = -0.25\ncontrast = 1.5\nsaturation = 2\n"
+	      "warmth = 0.5\ntint = -1\nsharpen = 0.5\n", f);
+	fclose(f);
+	CHECK(cdn_config_load(&c, compat, boards, s1, 2) == 0);
+	CHECK(c.picture.vignette == 0.5f && c.picture.brightness == -0.25f &&
+	      c.picture.contrast == 1.5f && c.picture.saturation == 2 && c.picture.warmth == 0.5f &&
+	      c.picture.tint == -1 && c.picture.sharpen == 0.5f);
+	{
+		static const char *const out_of_range[] = {
+			"vignette = 1.1", "brightness = -2", "contrast = 0.4", "contrast = 2.5",
+			"saturation = -0.1", "warmth = 1.5", "tint = -1.5", "sharpen = 2",
+		};
+
+		for (unsigned int i = 0; i < sizeof(out_of_range) / sizeof(out_of_range[0]); i++) {
+			f = fopen(user, "w");
+			fprintf(f, "[denoise]\n%s\n", out_of_range[i]);
+			fclose(f);
+			CHECK(cdn_config_load(&c, compat, boards, s1, 2) != 0);
+		}
+	}
+
 	const char *s2[] = { bad };
 	CHECK(cdn_config_load(&c, compat, boards, s2, 1) != 0);
 
