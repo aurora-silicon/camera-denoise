@@ -39,6 +39,7 @@
 #include "config.h"
 #include "gain.h"
 #include "effects.h"
+#include "picture.h"
 #include "pipewire-frame.h"
 #include "trigger.h"
 
@@ -95,6 +96,7 @@ struct cam {
 	const struct cdn_backend_ops *ops;
 	void *bstate;
 	struct cdn_effects *effects;
+	struct cdn_picture *picture; /* vignette and picture controls, last */
 	struct ce_config effect_cfg;
 	/* the low-light stage on top of the temporal one, if a plugin runs */
 	const struct cdn_backend_ops *ml_ops;
@@ -473,6 +475,14 @@ static void on_in_process(void *data)
 		/* start clean when the filter comes back */
 		if (c->bstate && c->ops->reset)
 			c->ops->reset(c->bstate);
+	}
+
+	/* The picture stage (vignette, brightness ... sharpen) on the finished frame. */
+	if (!cdn_picture_neutral(&c->app->cfg.picture)) {
+		if (!c->picture)
+			c->picture = cdn_picture_create();
+		if (c->picture)
+			cdn_picture_apply(c->picture, &c->app->cfg.picture, &fo);
 	}
 
 	uint64_t result_pts = ih && ih->pts > 0 ? (uint64_t)ih->pts : 0;
@@ -991,6 +1001,7 @@ static void cam_destroy(struct cam *c)
 	cdn_noise_tracker_free(&c->noise);
 	free(c->copy);
 	free(c->stage);
+	cdn_picture_destroy(c->picture);
 	spa_list_remove(&c->link);
 	free(c);
 }
