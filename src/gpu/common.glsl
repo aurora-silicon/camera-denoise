@@ -5,7 +5,7 @@ layout(set=0,binding=2,std430) buffer History { int hist[]; };
 layout(set=0,binding=3,std430) buffer Scratch { int tmp[]; };
 layout(set=0,binding=4,std430) writeonly buffer Output { uint dst[]; };
 layout(set=0,binding=5,std430) buffer Params { int par[]; };
-layout(push_constant) uniform Push { int w, h, sy, sc, oy, oc, strength, seed; } pc;
+layout(push_constant) uniform Push { int w, h, sy, sc, oy, oc, strength, seed, spatial, agemax; } pc;
 // History: Y, UV (Q4), age. Scratch: diff, horizontal signed sum, weight,
 // temporal Y/UV, first spatial UV. All offsets are in 32-bit words.
 #define N (pc.w * pc.h)

@@ -39,7 +39,25 @@ struct cdn_frame_info {
 	uint32_t exposure_us;
 	/* presentation time in nanoseconds */
 	uint64_t pts_ns;
+	/* the user's tuning (denoise.conf); tuned = 0: unset, backend defaults */
+	uint8_t tuned;
+	/* longest running mean of the temporal filter, 2..8 frames (default 8) */
+	uint8_t temporal_frames;
+	/* spatial smoothing level in 1/256 (0 = off, 256 = default) */
+	uint16_t spatial_q8;
 };
+
+/* The tuning in info, or the defaults when info is NULL or untuned. */
+static inline int cdn_info_age_max(const struct cdn_frame_info *info)
+{
+	int f = info && info->tuned ? info->temporal_frames : 8;
+	return (f < 2 ? 2 : f > 8 ? 8 : f) - 1;
+}
+static inline int cdn_info_spatial_q8(const struct cdn_frame_info *info)
+{
+	int v = info && info->tuned ? info->spatial_q8 : 256;
+	return v > 256 ? 256 : v;
+}
 
 struct cdn_backend_ops {
 	/* CDN_BACKEND_ABI */

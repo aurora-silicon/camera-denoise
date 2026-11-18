@@ -10,5 +10,8 @@ void cdn_cpu_destroy(void *state);
 /* process with the NEON path on or off (tests compare the two) */
 int cdn_cpu_process_ex(void *state, const struct cdn_frame *in,
 		       struct cdn_frame *out, float strength, bool neon);
+/* the same with the user's tuning from info (NULL: defaults) */
+int cdn_cpu_process_tuned(void *state, const struct cdn_frame *in, struct cdn_frame *out,
+			  const struct cdn_frame_info *info, float strength, bool neon);
 
 #endif
