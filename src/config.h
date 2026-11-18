@@ -6,6 +6,7 @@
 #include <stddef.h>
 
 #include "trigger.h"
+#include "picture.h"
 
 struct cdn_framing_cfg {
 	bool supported;
@@ -46,6 +47,8 @@ struct cdn_config {
 	float strength;
 	float spatial;
 	int temporal_frames;
+	/* the picture stage after the denoiser (picture.h): all neutral by default */
+	struct cdn_picture_cfg picture;
 	char drivers[128];	/* V4L2 drivers whose sources get a filter */
 	char board[64];		/* matched sensor:<name> or compatible, "" if none */
 };
