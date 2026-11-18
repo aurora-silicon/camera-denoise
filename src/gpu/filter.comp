@@ -6,7 +6,7 @@ layout(local_size_x=128) in;
 layout(constant_id=0) const int PASS=0;
 
 int spatial(int base, int x, int y, int dist, bool chroma) {
-    int c=tmp[base+y*pc.w+x], tt=par[chroma ? 11 : 10];
+    int c=tmp[base+y*pc.w+x], tt=(par[chroma ? 11 : 10]*pc.spatial)>>8;
     int bo=chroma ? 2*dist : dist, height=chroma ? pc.h/2 : pc.h;
     if (x<bo || x>=pc.w-bo || y<dist || y>=height-dist) return c;
     if (!chroma) tt=max(mulq(tt,tmp[KY+y*pc.w+x]),(tt+3)>>2);
@@ -79,7 +79,7 @@ void main() {
         for(int dy=-2;dy<=2;dy++) a+=tmp[HS+at(x,y+dy)];
         int km=4095+max(ramp(m,par[2],par[3],par[4],par[5]),ramp(abs(a),par[6],par[7],par[8],par[9]));
         int ag=hist[AGE+i], kk=max(km,32767/(ag+1));
-        hist[AGE+i]=km>16383 ? 1 : min(ag+1,7);
+        hist[AGE+i]=km>16383 ? 1 : min(ag+1,pc.agemax);
         int nh=hist[HY+i]+mulq((src(x,y,false)<<4)-hist[HY+i],kk);
         hist[HY+i]=nh; tmp[KY+i]=kk; tmp[TY+i]=sat((nh+8)>>4);
     } else if(PASS==4) {

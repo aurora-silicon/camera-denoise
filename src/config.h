@@ -36,6 +36,16 @@ struct cdn_config {
 	char backend[32];	/* auto, cpu or a plugin name */
 	char prefer[64];	/* plugins "auto" tries before cpu */
 	int threads;		/* 0: backend default */
+	/*
+	 * Tuning: strength mixes the filtered picture with the camera's
+	 * (1 = filtered only, 0.5 = half of each), spatial scales the 3x3
+	 * smoothing that follows the temporal filter (0 = none, 1 = full),
+	 * temporal_frames caps the running mean (fewer = less smear on motion,
+	 * more grain left).
+	 */
+	float strength;
+	float spatial;
+	int temporal_frames;
 	char drivers[128];	/* V4L2 drivers whose sources get a filter */
 	char board[64];		/* matched sensor:<name> or compatible, "" if none */
 };

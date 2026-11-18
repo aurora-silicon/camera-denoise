@@ -90,6 +90,8 @@ struct cdn_cpu {
 	int shift, ashift;
 	int16_t ts_y, ts_c;     /* spatial clip levels */
 	int strength8;          /* 0..256 */
+	int age_max;            /* 1..AGE_MAX: longest running mean - 1 (tuning) */
+	int spatial_q8;         /* 0..256: spatial clip scale (tuning) */
 
 	const struct cdn_frame *in;
 	struct cdn_frame *out;
@@ -238,6 +240,9 @@ static void set_params(struct cdn_cpu *s)
 	/* spatial clip: about 2 sigma on luma, 3 on chroma (sigma = 1.75 med) */
 	s->ts_y = clamp16((med * 7 + 16) >> 5, 1, 64);
 	s->ts_c = clamp16((medc * 21 + 32) >> 6, 1, 64);
+	/* tuning: 0 turns the spatial smoothing off (every clip level 0) */
+	s->ts_y = (int16_t)((s->ts_y * s->spatial_q8) >> 8);
+	s->ts_c = (int16_t)((s->ts_c * s->spatial_q8) >> 8);
 }
 
 /* ---------------------------------------------------------------------- */
@@ -362,7 +367,7 @@ static void pass_temporal_y(struct cdn_cpu *s, int y0, int y1)
 		uint16_t km = weight_scalar(s, m, av);                            \
 		uint16_t ka = age_weight[age[X]];                                 \
 		uint16_t kk = km > ka ? km : ka;                                  \
-		age[X] = km > KMAX / 2 ? 1 : age[X] + 1 > AGE_MAX ? AGE_MAX : age[X] + 1; \
+		age[X] = km > KMAX / 2 ? 1 : age[X] + 1 > s->age_max ? s->age_max : age[X] + 1; \
 		int16_t delta = (int16_t)((src[X] << 4) - hist[X]);               \
 		int16_t nh = (int16_t)(hist[X] + qrdmulh(delta, (int16_t)kk));    \
 		hist[X] = nh;                                                     \
@@ -387,7 +392,7 @@ static void pass_temporal_y(struct cdn_cpu *s, int y0, int y1)
 			}
 			uint8x16_t rlo = vld1q_u8(tlo), rhi = vld1q_u8(thi);
 			uint16x8_t half = vdupq_n_u16(KMAX / 2);
-			uint8x8_t one = vdup_n_u8(1), amax = vdup_n_u8(AGE_MAX);
+			uint8x8_t one = vdup_n_u8(1), amax = vdup_n_u8((uint8_t)s->age_max);
 			for (; x + 8 <= w - 1; x += 8) {
 				/* 3x3 sum in u16 */
 				uint16x8_t m = vdupq_n_u16(0);
@@ -723,6 +728,8 @@ static void *cpu_create(int width, int height, int threads)
 	s->sig_y16 = 2 * 16;
 	s->sig_c16 = 1 * 16;
 	s->strength8 = 256;
+	s->age_max = AGE_MAX;
+	s->spatial_q8 = 256;
 
 	/*
 	 * One thread by default: it costs the least CPU time. A 1080p frame
@@ -817,7 +824,16 @@ static void update_noise(struct cdn_cpu *s, const struct cdn_frame *in)
 int cdn_cpu_process_ex(void *p, const struct cdn_frame *in, struct cdn_frame *out,
 		       float strength, bool neon)
 {
+	return cdn_cpu_process_tuned(p, in, out, NULL, strength, neon);
+}
+
+int cdn_cpu_process_tuned(void *p, const struct cdn_frame *in, struct cdn_frame *out,
+			  const struct cdn_frame_info *info, float strength, bool neon)
+{
 	struct cdn_cpu *s = p;
+
+	s->age_max = cdn_info_age_max(info);
+	s->spatial_q8 = cdn_info_spatial_q8(info);
 
 	if (in->width != s->w || in->height != s->h || out->width != s->w ||
 	    out->height != s->h)
@@ -845,8 +861,7 @@ int cdn_cpu_process_ex(void *p, const struct cdn_frame *in, struct cdn_frame *ou
 static int cpu_process(void *p, const struct cdn_frame *in, struct cdn_frame *out,
 		       const struct cdn_frame_info *info, float strength)
 {
-	(void)info;
-	return cdn_cpu_process_ex(p, in, out, strength, true);
+	return cdn_cpu_process_tuned(p, in, out, info, strength, true);
 }
 
 static float cpu_noise_sigma(void *p)

@@ -47,6 +47,10 @@ static int run(const struct cdn_backend_ops *gpu, const struct cdn_backend_dmabu
 		float strength = frame < 16 ? 1 : frame < 24 ? 0 : frame < 32 ? 0.375f : 1;
 		if (frame == 33) strength = -0.5f;
 		if (frame == 34) strength = 1.5f;
+		// The user's tuning (denoise.conf strength/spatial/temporal-frames) must stay bit-exact too.
+		if (frame >= 40)
+			info = (struct cdn_frame_info){ .tuned = 1, .temporal_frames = frame < 56 ? 3 : 5,
+							.spatial_q8 = frame < 56 ? 0 : 160 };
 		if (frame == 16) {
 			struct cdn_dmabuf unavailable = { w,h,{-1,0,(uint32_t)w},{-1,0,(uint32_t)w} };
 			if (!dma || dma->abi != CDN_DMABUF_ABI ||

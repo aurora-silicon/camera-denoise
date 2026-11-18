@@ -18,7 +18,12 @@
 #include <stdint.h>
 #include <stddef.h>
 
-#define CDN_BACKEND_ABI 1
+/*
+ * 2: struct cdn_frame_info gained tuned, temporal_frames and spatial_q8, which
+ * plugins read; an ABI 1 caller's info is too short for them, so a plugin
+ * and its caller must agree on 2.
+ */
+#define CDN_BACKEND_ABI 2
 #define CDN_BACKEND_ENTRY "cdn_backend_entry"
 
 /* One NV12 frame: a luma plane and an interleaved half-height CbCr plane. */
@@ -39,7 +44,25 @@ struct cdn_frame_info {
 	uint32_t exposure_us;
 	/* presentation time in nanoseconds */
 	uint64_t pts_ns;
+	/* the user's tuning (denoise.conf); tuned = 0: unset, backend defaults */
+	uint8_t tuned;
+	/* longest running mean of the temporal filter, 2..8 frames (default 8) */
+	uint8_t temporal_frames;
+	/* spatial smoothing level in 1/256 (0 = off, 256 = default) */
+	uint16_t spatial_q8;
 };
+
+/* The tuning in info, or the defaults when info is NULL or untuned. */
+static inline int cdn_info_age_max(const struct cdn_frame_info *info)
+{
+	int f = info && info->tuned ? info->temporal_frames : 8;
+	return (f < 2 ? 2 : f > 8 ? 8 : f) - 1;
+}
+static inline int cdn_info_spatial_q8(const struct cdn_frame_info *info)
+{
+	int v = info && info->tuned ? info->spatial_q8 : 256;
+	return v > 256 ? 256 : v;
+}
 
 struct cdn_backend_ops {
 	/* CDN_BACKEND_ABI */
@@ -69,13 +92,14 @@ struct cdn_backend_ops {
 
 typedef const struct cdn_backend_ops *(*cdn_backend_entry_fn)(void);
 
-/* Optional ABI v1 companion symbol; the original ops/frame layouts stay intact.
+/* Optional companion symbol, versioned with CDN_DMABUF_ABI (its process takes
+ * the same struct cdn_frame_info, so it moved to 2 with CDN_BACKEND_ABI).
  * Borrowed, linear NV12 DMA-BUFs; offsets are from the start of each fd,
  * including the PipeWire mapoffset and chunk offset. The caller owns the
  * buffers until this synchronous call returns. No explicit-sync streams.
  */
 #define CDN_DMABUF_ENTRY "cdn_backend_dmabuf_entry"
-#define CDN_DMABUF_ABI 1
+#define CDN_DMABUF_ABI 2
 #define CDN_BACKEND_SINGLE_UPLOAD 1u
 struct cdn_dmabuf_plane {
 	int fd;
@@ -97,7 +121,7 @@ struct cdn_backend_dmabuf_ops {
 typedef const struct cdn_backend_dmabuf_ops *(*cdn_backend_dmabuf_entry_fn)(void);
 const struct cdn_backend_dmabuf_ops *cdn_backend_dmabuf(const struct cdn_backend_ops *ops);
 
-/* Optional ABI v1 companion symbol: answers questions about one instance.
+/* Optional companion symbol: answers questions about one instance.
  * Returns 1 for yes, 0 for no, negative for unknown questions. */
 #define CDN_QUERY_ENTRY "cdn_backend_query"
 /* Yes when this instance runs the backend's full hardware path, so

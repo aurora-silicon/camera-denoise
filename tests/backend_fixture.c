@@ -9,7 +9,7 @@ static int process(void *s, const struct cdn_frame *i, struct cdn_frame *o,
 static void destroy(void *s) { (void)s; }
 static const struct cdn_backend_ops ops = {
 #ifdef BAD_ABI
-	.abi = 0,
+	.abi = CDN_BACKEND_ABI - 1, /* a plugin built for the previous ABI */
 #else
 	.abi = CDN_BACKEND_ABI,
 #endif

@@ -85,6 +85,26 @@ int main(int argc, char **argv)
 	fclose(f);
 	CHECK(cdn_config_load(&c, compat, boards, s1, 2) != 0);
 
+	/* the tuning keys, and their ranges */
+	f = fopen(user, "w");
+	fputs("[denoise]\nstrength = 0.5\nspatial = 0.25\ntemporal-frames = 4\n", f);
+	fclose(f);
+	CHECK(cdn_config_load(&c, compat, boards, s1, 2) == 0);
+	CHECK(c.strength == 0.5f && c.spatial == 0.25f && c.temporal_frames == 4);
+	{
+		static const char *const out_of_range[] = {
+			"strength = 1.5", "strength = -0.1", "spatial = 2", "temporal-frames = 1",
+			"temporal-frames = 9", "temporal-frames = 3.5", "strength = much",
+		};
+
+		for (unsigned int i = 0; i < sizeof(out_of_range) / sizeof(out_of_range[0]); i++) {
+			f = fopen(user, "w");
+			fprintf(f, "[denoise]\n%s\n", out_of_range[i]);
+			fclose(f);
+			CHECK(cdn_config_load(&c, compat, boards, s1, 2) != 0);
+		}
+	}
+
 	const char *s2[] = { bad };
 	CHECK(cdn_config_load(&c, compat, boards, s2, 1) != 0);
 
