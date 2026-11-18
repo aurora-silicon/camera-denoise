@@ -21,7 +21,7 @@
 #define PARAM_BYTES ((16 + 288) * sizeof(int32_t))
 struct buffer { VkBuffer buf; VkDeviceMemory mem; VkDeviceSize size; void *map; bool coherent; };
 struct imported { struct buffer b; dev_t dev; ino_t ino; };
-struct push { int32_t w, h, sy, sc, oy, oc, strength, seed; };
+struct push { int32_t w, h, sy, sc, oy, oc, strength, seed, spatial, agemax; };
 struct gpu {
 	int w, h;
 	bool valid, dead, dma, can_dma;
@@ -392,27 +392,26 @@ static bool valid_output(struct gpu *s, struct cdn_frame *out)
 		out->stride_y >= s->w && out->stride_uv >= s->w;
 }
 
-static struct push parameters(struct gpu *s, float strength)
+static struct push parameters(struct gpu *s, const struct cdn_frame_info *info, float strength)
 {
 	if (!isfinite(strength)) strength = 0;
 	if (strength < 0) strength = 0;
 	if (strength > 1) strength = 1;
 	return (struct push){ s->w, s->h, s->w, s->w, 0, s->w*s->h,
-		(int32_t)(strength*256+0.5f), !s->valid };
+		(int32_t)(strength*256+0.5f), !s->valid, cdn_info_spatial_q8(info), cdn_info_age_max(info) };
 }
 
 static int gpu_process(void *p, const struct cdn_frame *in, struct cdn_frame *out,
 		       const struct cdn_frame_info *info, float strength)
 {
 	struct gpu *s = p;
-	(void)info;
 	if (!valid_output(s, out) || !in || !in->y || !in->uv || in->width != s->w ||
 	    in->height != s->h || in->stride_y < s->w || in->stride_uv < s->w) return -EINVAL;
 	struct cdn_frame upload = { s->b[0].map, (uint8_t *)s->b[0].map+(size_t)s->w*s->h,
 		s->w, s->h, s->w, s->w };
 	copy_frame(in, &upload);
 	int rc = cache_sync(s, &s->b[0], false);
-	struct push pc = parameters(s, strength);
+	struct push pc = parameters(s, info, strength);
 	if (!rc) rc = execute(s, &s->b[0], &s->b[0], &pc, out, false);
 	if (!rc && !s->said_upload) {
 		fprintf(stderr, "camera-denoise: gpu: using one upload for mapped NV12 input\n");
@@ -457,7 +456,6 @@ static int gpu_dmabuf(void *p, const struct cdn_dmabuf *in, struct cdn_frame *ou
 		      const struct cdn_frame_info *info, float strength)
 {
 	struct gpu *s = p;
-	(void)info;
 	if (!valid_output(s, out)) return -EINVAL;
 	if (!s->dma || !in || in->y.fd < 0 || in->uv.fd < 0 || in->width != s->w || in->height != s->h ||
 	    in->y.stride < (uint32_t)s->w || in->uv.stride < (uint32_t)s->w ||
@@ -478,7 +476,7 @@ static int gpu_dmabuf(void *p, const struct cdn_dmabuf *in, struct cdn_frame *ou
 	int rc = wait_producer(in->y.fd);
 	if (!rc && in->uv.fd != in->y.fd) rc = wait_producer(in->uv.fd);
 	if (rc) return -EAGAIN; // leave history intact; do not read an unfinished frame
-	struct push pc = parameters(s, strength);
+	struct push pc = parameters(s, info, strength);
 	pc.sy = (int32_t)in->y.stride; pc.sc = (int32_t)in->uv.stride;
 	pc.oy = (int32_t)in->y.offset; pc.oc = (int32_t)in->uv.offset;
 	if (!rc) rc = execute(s, y, uv, &pc, out, true);

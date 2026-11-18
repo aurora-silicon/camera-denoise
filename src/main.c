@@ -419,7 +419,11 @@ static void on_in_process(void *data)
 	bool temporal = c->app->cfg.temporal && c->app->cfg.mode != CDN_MODE_OFF;
 
 	if ((temporal || strength > 0) && c->bstate) {
-		struct cdn_frame_info info = { gain, exposure, ih ? (uint64_t)ih->pts : 0 };
+		const struct cdn_config *cfg = &c->app->cfg;
+		struct cdn_frame_info info = { gain, exposure, ih ? (uint64_t)ih->pts : 0, 1,
+					       (uint8_t)cfg->temporal_frames,
+					       (uint16_t)(cfg->spatial * 256.0f + 0.5f) };
+		float user = cfg->strength;
 		bool boost = temporal && c->ml_state && strength > 0;
 		double t0 = mono_ms();
 		size_t need = (size_t)w * h * 3 / 2;
@@ -453,14 +457,14 @@ static void on_in_process(void *data)
 			/* temporal result B, then the low-light stage blends a*M(B) over it */
 			struct cdn_frame sf = { c->stage, c->stage + (size_t)w * h, w, h, w, w };
 
-			int rc = temporal_process(c, &fi, &sf, &info, 1.0f, dma_in);
+			int rc = temporal_process(c, &fi, &sf, &info, user, dma_in);
 			if (rc == -EAGAIN) goto drop_frame;
 			if (rc) cdn_frame_copy(&fi, &sf);
-			if (c->ml_ops->process(c->ml_state, &sf, &fo, &info, strength))
+			if (c->ml_ops->process(c->ml_state, &sf, &fo, &info, strength * user))
 				cdn_frame_copy(&sf, &fo);
 			c->boosted++;
 		} else {
-			int rc = temporal_process(c, &fi, &fo, &info, temporal ? 1.0f : strength, dma_in);
+			int rc = temporal_process(c, &fi, &fo, &info, (temporal ? 1.0f : strength) * user, dma_in);
 			if (rc == -EAGAIN) goto drop_frame;
 			if (rc) cdn_frame_copy(&fi, &fo);
 		}

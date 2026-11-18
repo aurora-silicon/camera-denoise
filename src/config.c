@@ -20,6 +20,9 @@ static void defaults(struct cdn_config *c)
 	c->temporal = true;
 	c->low_light_frame_rate = true;
 	snprintf(c->temporal_backend, sizeof(c->temporal_backend), "auto");
+	c->strength = 1.0f;
+	c->spatial = 1.0f;
+	c->temporal_frames = 8;
 	snprintf(c->backend, sizeof(c->backend), "auto");
 	snprintf(c->prefer, sizeof(c->prefer), "ane");
 	snprintf(c->drivers, sizeof(c->drivers), "apple-isp");
@@ -81,6 +84,10 @@ static int set_key(struct cdn_config *c, const char *k, const char *v, bool sett
 	else if (settings && !strcmp(k, "backend")) snprintf(c->backend, sizeof(c->backend), "%s", v);
 	else if (settings && !strcmp(k, "prefer")) snprintf(c->prefer, sizeof(c->prefer), "%s", v);
 	else if (settings && !strcmp(k, "threads") && num) c->threads = (int)d;
+	else if (settings && !strcmp(k, "strength") && num && d >= 0 && d <= 1) c->strength = (float)d;
+	else if (settings && !strcmp(k, "spatial") && num && d >= 0 && d <= 1) c->spatial = (float)d;
+	else if (settings && !strcmp(k, "temporal-frames") && num && d >= 2 && d <= 8 && d == (int)d)
+		c->temporal_frames = (int)d;
 	else if (settings && !strcmp(k, "drivers")) snprintf(c->drivers, sizeof(c->drivers), "%s", v);
 	else return -1;
 	return 0;
@@ -321,10 +328,11 @@ void cdn_config_print(const struct cdn_config *c)
 	fprintf(stderr,
 		"camera-denoise: board %s, mode %s, temporal %s (%s), low-light frame rate %s, "
 		"backend %s (prefer %s), "
-		"enter gain >= %u, exit < %u, noise %.2f/%.2f, fps <= %.0f, ramp %d/%d frames\n",
+		"enter gain >= %u, exit < %u, noise %.2f/%.2f, fps <= %.0f, ramp %d/%d frames, "
+		"strength %.2f, spatial %.2f, temporal frames %d\n",
 		*c->board ? c->board : "(no board data)", cdn_mode_name(c->mode),
 		c->temporal ? "on" : "off", cdn_temporal_auto(c) ? "auto" : cdn_temporal_backend(c), c->low_light_frame_rate ? "on" : "off", c->backend,
 		c->prefer, c->trig.enter_gain, c->trig.exit_gain, c->trig.enter_noise,
 		c->trig.exit_noise, c->trig.fps_threshold, c->trig.ramp_up_frames,
-		c->trig.ramp_down_frames);
+		c->trig.ramp_down_frames, c->strength, c->spatial, c->temporal_frames);
 }

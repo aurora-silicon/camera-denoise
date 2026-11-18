@@ -98,6 +98,37 @@ int main(void)
 		fprintf(stderr, "ghosting: trail mse %.1f > raw %.1f\n", ghost_den / 25, ghost_raw / 25);
 		fails++;
 	}
+	/* The user's tuning: NEON and scalar still agree, and a lighter setting
+	 * (3-frame mean, quarter spatial smoothing) removes less than the default. */
+	{
+		void *ta = cdn_cpu_create(W, H, 1), *tb = cdn_cpu_create(W, H, 3);
+		struct cdn_frame_info ti = { .tuned = 1, .temporal_frames = 3, .spatial_q8 = 64 };
+		double tuned_mse = 0;
+		for (int i = 0; i < 40; i++) {
+			struct cdn_frame fi = { n, n + W * H, W, H, W, W };
+			struct cdn_frame fa = { o1, o1 + W * H, W, H, W, W };
+			struct cdn_frame fb = { o2, o2 + W * H, W, H, W, W };
+			truth(t, i);
+			noisy(n, t, 8.0);
+			cdn_cpu_process_tuned(ta, &fi, &fa, &ti, 1.0f, false);
+			cdn_cpu_process_tuned(tb, &fi, &fb, &ti, 1.0f, true);
+			if (memcmp(o1, o2, fs)) {
+				fprintf(stderr, "tuned frame %d: scalar and NEON differ\n", i);
+				fails++;
+				break;
+			}
+			if (i >= 15)
+				tuned_mse += mse_y(o1, t, 0, W, 0, 50);
+		}
+		double tuned_db = 10 * log10(raw_mse / tuned_mse);
+		printf("tuned (3 frames, spatial 0.25): %.2f dB better (default %.2f dB)\n", tuned_db, gain_db);
+		if (!(tuned_db > 1 && tuned_db < gain_db - 1)) {
+			fprintf(stderr, "tuning did not lighten the filter: %.2f dB vs %.2f dB\n", tuned_db, gain_db);
+			fails++;
+		}
+		cdn_cpu_destroy(ta);
+		cdn_cpu_destroy(tb);
+	}
 	cdn_cpu_destroy(sa);
 	cdn_cpu_destroy(sb);
 	free(t); free(n); free(o1); free(o2);
