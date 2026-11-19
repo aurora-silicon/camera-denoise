@@ -118,8 +118,8 @@ int main(int argc, char **argv)
 	int m = total - skip;
 	printf("backend=%s %dx%d frames=%d threads=%d strength=%.2f\n", ops->name, w, h, total,
 	       threads, strength);
-	printf("latency_ms p50=%.2f p95=%.2f max=%.2f\n", lat[skip + m / 2], lat[skip + (size_t)m * 95 / 100],
-	       lat[total - 1]);
+	printf("latency_ms p50=%.2f p95=%.2f p99=%.2f max=%.2f\n", lat[skip + m / 2],
+	       lat[skip + (size_t)m * 95 / 100], lat[skip + (size_t)m * 99 / 100], lat[total - 1]);
 	printf("cpu_ms_per_frame=%.2f wall_ms_per_frame=%.2f cpu_pct_at_30fps=%.1f sigma=%.2f\n",
 	       cpu / total, wall / total, cpu / total * 30 / 10, ops->noise_sigma ? ops->noise_sigma(st) : -1);
 	printf("measured_cpu_pct=%.1f paced_fps=%.2f\n", wall > 0 ? cpu/wall*100 : 0, fps);
