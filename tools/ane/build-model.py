@@ -86,6 +86,8 @@ def main():
     ap.add_argument('--width', type=int, required=True)
     ap.add_argument('--height', type=int, required=True)
     ap.add_argument('--out', type=pathlib.Path, required=True)
+    ap.add_argument('--target', default='H16G', choices=['H16G', 'H17'],
+                    help='ANE generation (default H16G)')
     a = ap.parse_args()
     parts = [p for pair in split_weights(a.weights.read_bytes()) for p in pair]
     data, offsets = blobfile(parts)
@@ -94,7 +96,7 @@ def main():
         (src / 'weights').mkdir(parents=True)
         (src / 'weights' / 'weight.bin').write_bytes(data)
         (src / 'model.mil').write_text(mil(a.width, a.height, offsets))
-        subprocess.run([a.mil_hwxc, '--target', 'H16G', '--format', 'hwx', '--schedule', 'linked',
+        subprocess.run([a.mil_hwxc, '--target', a.target, '--format', 'hwx', '--schedule', 'linked',
                         '--mil', str(src / 'model.mil'), '--model-root', str(src),
                         '--output', str(pathlib.Path(tmp) / 'out')], check=True)
         objects = sorted((pathlib.Path(tmp) / 'out').rglob('*.hwx'))
