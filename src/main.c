@@ -104,6 +104,7 @@ struct cam {
 	struct cdn_trigger trig;
 	struct cdn_gain gain;
 	bool gain_tried;
+	bool sensor_known;
 	struct cdn_noise_tracker noise;
 
 	/*
@@ -130,6 +131,7 @@ struct app {
 	struct spa_hook registry_listener;
 	struct spa_list cams;
 	struct cdn_config cfg;
+	char sensor[64];
 	const char *cli_mode, *cli_backend, *cli_config, *cli_temporal_backend;
 	const char *boards_path;
 	const char *stream_name;
@@ -138,12 +140,13 @@ struct app {
 
 static void cam_stop_input(struct cam *c);
 static int cam_start_input(struct cam *c);
+static void refresh_cam_sensor(struct cam *c);
 
 /* ---------------------------------------------------------------------- */
 
 static int load_config(struct app *a)
 {
-	char user[PATH_MAX];
+	char user[PATH_MAX], detected[64];
 	struct cdn_config next;
 	const char *xdg = getenv("XDG_CONFIG_HOME"), *home = getenv("HOME");
 	const char *settings[2] = { CDN_SYSCONFDIR "/aurora-camera-denoise/denoise.conf", NULL };
@@ -164,9 +167,17 @@ static int load_config(struct app *a)
 		settings[0] = a->cli_config;
 		settings[1] = NULL;
 	}
-	if (cdn_config_load(&next, "/proc/device-tree/compatible", a->boards_path,
-			    settings, 2))
+	if (cdn_config_load_sensor(&next, a->sensor[0] ? a->sensor : NULL,
+				   "/proc/device-tree/compatible", a->boards_path,
+				   settings, 2))
 		return -1;
+	if (!a->sensor[0] &&
+	    cdn_sysfs_find_sensor(NULL, next.drivers, detected, sizeof(detected))) {
+		snprintf(a->sensor, sizeof(a->sensor), "%s", detected);
+		if (cdn_config_load_sensor(&next, a->sensor, "/proc/device-tree/compatible",
+					   a->boards_path, settings, 2))
+			return -1;
+	}
 	if (a->cli_mode && cdn_mode_parse(a->cli_mode, &next.mode)) {
 		fprintf(stderr, "camera-denoise: bad --mode %s\n", a->cli_mode);
 		return -1;
@@ -188,15 +199,7 @@ static int load_config(struct app *a)
 
 static bool driver_listed(const struct app *a, const char *drv)
 {
-	char buf[128], *save = NULL;
-
-	if (!drv)
-		return false;
-	snprintf(buf, sizeof(buf), "%s", a->cfg.drivers);
-	for (char *t = strtok_r(buf, ", ", &save); t; t = strtok_r(NULL, ", ", &save))
-		if (!strcmp(t, drv))
-			return true;
-	return false;
+	return cdn_driver_listed(a->cfg.drivers, drv);
 }
 
 /* ---------------------------------------------------------------------- */
@@ -398,6 +401,7 @@ static void on_in_process(void *data)
 		(float)c->fmt.framerate.num / (float)c->fmt.framerate.denom : c->fps_meas;
 
 	/* what the sensor is doing */
+	refresh_cam_sensor(c);
 	if (!c->gain_tried) {
 		c->gain_tried = true;
 		if (cdn_gain_open(&c->gain, c->v4l2_path))
@@ -569,9 +573,12 @@ static void on_in_state(void *data, enum pw_stream_state old, enum pw_stream_sta
 			fprintf(stderr, "camera-denoise: %s: camera unavailable, retrying while "
 				"a client waits\n", c->src_nick);
 		schedule_retry(c);
-	} else if (state == PW_STREAM_STATE_STREAMING && c->retry_ms) {
-		fprintf(stderr, "camera-denoise: %s: camera available again\n", c->src_nick);
-		c->retry_ms = 0;
+	} else if (state == PW_STREAM_STATE_STREAMING) {
+		if (c->retry_ms) {
+			fprintf(stderr, "camera-denoise: %s: camera available again\n", c->src_nick);
+			c->retry_ms = 0;
+		}
+		refresh_cam_sensor(c);
 	}
 	(void)old;
 }
@@ -922,6 +929,7 @@ static void src_info(void *data, const struct pw_node_info *info)
 	c->src_prio = p ? atoi(p) : 0;
 	fprintf(stderr, "camera-denoise: found %s (%s, %s)\n", c->src_name, drv,
 		c->v4l2_path);
+	refresh_cam_sensor(c);
 
 	c->enum_seq = pw_node_enum_params((struct pw_node *)c->src_proxy, 0,
 					  SPA_PARAM_EnumFormat, 0, UINT32_MAX, NULL);
@@ -1053,35 +1061,69 @@ static const struct pw_registry_events registry_events = {
 	.global_remove = on_global_remove,
 };
 
+static void apply_config_to_cams(struct app *a)
+{
+	struct cam *c;
+
+	spa_list_for_each(c, &a->cams, link) {
+		cdn_trigger_init(&c->trig, &a->cfg.trig, a->cfg.mode);
+		if (!a->cfg.framing.supported)
+			c->effect_cfg.framing = 0;
+		if (c->effect_cfg.zoom != 0 &&
+		    (c->effect_cfg.zoom < a->cfg.framing.minimum ||
+		     c->effect_cfg.zoom > a->cfg.framing.maximum))
+			c->effect_cfg.zoom = 0;
+		if (c->out) {
+			struct pw_properties *caps = pw_properties_new(NULL, NULL);
+			if (caps) {
+				effect_capabilities(c, caps);
+				pw_stream_update_properties(c->out, &caps->dict);
+				pw_properties_free(caps);
+			}
+			uint8_t buffer[2048];
+			struct spa_pod_builder builder = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
+			const struct spa_pod *props = effect_props(c, &builder);
+			pw_stream_update_params(c->out, &props, 1);
+		}
+		if (c->have_fmt) {
+			setup_backend(c);
+			setup_effects(c);
+		}
+	}
+}
+
+static void refresh_cam_sensor(struct cam *c)
+{
+	struct app *a = c->app;
+	char sensor[64];
+
+	if (c->sensor_known || !c->v4l2_path[0])
+		return;
+	if (!cdn_v4l2_sensor(c->v4l2_path, NULL, sensor, sizeof(sensor)))
+		return;
+	c->sensor_known = true;
+	if (!strcmp(a->sensor, sensor))
+		return;
+	snprintf(a->sensor, sizeof(a->sensor), "%s", sensor);
+	if (load_config(a) == 0)
+		apply_config_to_cams(a);
+}
+
 static void on_signal(void *data, int sig)
 {
 	struct app *a = data;
 	struct cam *c;
 
 	if (sig == SIGHUP) {
+		a->sensor[0] = 0;
+		spa_list_for_each(c, &a->cams, link) {
+			c->sensor_known = false;
+			if (!a->sensor[0] && c->v4l2_path[0] &&
+			    cdn_v4l2_sensor(c->v4l2_path, NULL, a->sensor, sizeof(a->sensor)))
+				c->sensor_known = true;
+		}
 		if (load_config(a) == 0)
-			spa_list_for_each(c, &a->cams, link) {
-				cdn_trigger_init(&c->trig, &a->cfg.trig, a->cfg.mode);
-				if (!a->cfg.framing.supported) c->effect_cfg.framing = 0;
-				if (c->effect_cfg.zoom != 0 && (c->effect_cfg.zoom < a->cfg.framing.minimum ||
-					c->effect_cfg.zoom > a->cfg.framing.maximum)) c->effect_cfg.zoom = 0;
-				if (c->out) {
-					struct pw_properties *caps = pw_properties_new(NULL, NULL);
-					if (caps) {
-						effect_capabilities(c, caps);
-						pw_stream_update_properties(c->out, &caps->dict);
-						pw_properties_free(caps);
-					}
-					uint8_t buffer[2048];
-					struct spa_pod_builder builder = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
-					const struct spa_pod *props = effect_props(c, &builder);
-					pw_stream_update_params(c->out, &props, 1);
-				}
-				if (c->have_fmt) {
-					setup_backend(c);
-					setup_effects(c);
-				}
-			}
+			apply_config_to_cams(a);
 		return;
 	}
 	pw_main_loop_quit(a->loop);

@@ -3,6 +3,7 @@
 #define CDN_CONFIG_H
 
 #include <stdbool.h>
+#include <stddef.h>
 
 #include "trigger.h"
 
@@ -36,15 +37,39 @@ struct cdn_config {
 	char prefer[64];	/* plugins "auto" tries before cpu */
 	int threads;		/* 0: backend default */
 	char drivers[128];	/* V4L2 drivers whose sources get a filter */
-	char board[64];		/* matched compatible, "" if none */
+	char board[64];		/* matched sensor:<name> or compatible, "" if none */
 };
 
+/* true when @drv appears in the comma/space-separated @drivers list */
+bool cdn_driver_listed(const char *drivers, const char *drv);
+
 /*
- * Defaults, then the [<compatible>] section of boards_path matching the
- * first device-tree compatible that has one, then each settings file in
- * order ([denoise] section; later files win). Missing files are fine.
+ * Read the camera sensor name from <sysfs_root>/class/video4linux/<dev>/device/sensor
+ * (@sysfs_root NULL means "/sys"). Returns false when absent or not yet detected
+ * (-ENODATA before a deferred camera start).
+ */
+bool cdn_v4l2_sensor(const char *v4l2_path, const char *sysfs_root,
+		     char *sensor, size_t sensor_sz);
+
+/*
+ * Scan <sysfs_root>/class/video4linux for the first camera bound to a driver in
+ * @drivers (or any driver if @drivers is NULL/empty) that already reports a
+ * sensor name in sysfs.
+ */
+bool cdn_sysfs_find_sensor(const char *sysfs_root, const char *drivers,
+			   char *sensor, size_t sensor_sz);
+
+/*
+ * Defaults, then [sensor:<sensor>] in boards_path if @sensor is non-empty and
+ * present, otherwise the [<compatible>] section of boards_path matching the
+ * first device-tree compatible that has one, then each settings file in order
+ * ([denoise] section; later files win). Missing files are fine.
  * Returns 0, or -1 with a message on stderr for a malformed file.
  */
+int cdn_config_load_sensor(struct cdn_config *c, const char *sensor,
+			   const char *compat_path, const char *boards_path,
+			   const char *const *settings, int nsettings);
+
 int cdn_config_load(struct cdn_config *c, const char *compat_path,
 		    const char *boards_path, const char *const *settings,
 		    int nsettings);

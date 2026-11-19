@@ -122,6 +122,6 @@ endif
 test('cpu', executable('test_cpu', 'tests/test_cpu.c', dependencies : core_dep))
 test('trigger', executable('test_trigger', 'tests/test_trigger.c', dependencies : core_dep))
 test('config', executable('test_config', 'tests/test_config.c', dependencies : core_dep),
-  args : [meson.current_build_dir()])
+  args : [meson.current_build_dir(), files('data/boards.conf')])
 
 test('effects', executable('test_effects', 'tests/test_effects.c', dependencies : core_dep))

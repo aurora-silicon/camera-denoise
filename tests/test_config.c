@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include "../src/config.h"
 
@@ -112,6 +114,108 @@ int main(int argc, char **argv)
 		f = fopen(optin, "a"); fputs("framing-zoom-max = 9\n", f); fclose(f);
 		CHECK(cdn_config_load(&c, compat, boards, s3, 1) != 0);
 		remove(optin);
+	}
+
+	/* Sensor-keyed profiles: [sensor:<name>] takes priority over board
+	 * compatible fallback, covers J614s/J616s/J614c/J616c via shipped
+	 * boards.conf, and upgrades cleanly after deferred camera detection. */
+	{
+		const char *shipped = argc > 2 ? argv[2] : "../data/boards.conf";
+		char sysfs[256], v0_dev[1024], v0_drv[1088], v0_sensor[1088];
+		char v1_dev[1024], v1_drv[1088], v1_sensor[1088], tmp[1024];
+		char compat_m4[512], sensor[64] = "";
+
+		snprintf(compat_m4, sizeof(compat_m4), "%s/compat-j616c", dir);
+		f = fopen(compat_m4, "wb");
+		fwrite("apple,j616c\0apple,t6041\0apple,arm-platform\0", 1, 43, f);
+		fclose(f);
+
+		CHECK(cdn_config_load_sensor(&c, "imx958-uw", compat_m4, shipped, NULL, 0) == 0);
+		CHECK(!strcmp(c.board, "sensor:imx958-uw"));
+		CHECK(c.trig.enter_gain == 3584 && c.trig.exit_gain == 2816);
+		CHECK(c.framing.supported && c.framing.minimum == 1.0f &&
+		      c.framing.maximum == 6.0f && c.framing.default_zoom == 1.5f);
+
+		/* User settings still override [sensor:imx958-uw] defaults. */
+		f = fopen(user, "w");
+		fputs("[denoise]\nexit-gain = 2400\nmode = on\n", f);
+		fclose(f);
+		const char *su[] = { user };
+		CHECK(cdn_config_load_sensor(&c, "imx958-uw", compat_m4, shipped, su, 1) == 0);
+		CHECK(!strcmp(c.board, "sensor:imx958-uw"));
+		CHECK(c.mode == CDN_MODE_ON && c.trig.enter_gain == 3584 && c.trig.exit_gain == 2400);
+
+		/*
+		 * A kernel without the sensor attribute (before linux#2216), or one
+		 * that has not detected the camera yet, gives no sensor: the J616s
+		 * keeps the [apple,j616s] profile it had before sensor keys.
+		 */
+		{
+			char compat_j616s[512];
+
+			snprintf(compat_j616s, sizeof(compat_j616s), "%s/compat-j616s", dir);
+			f = fopen(compat_j616s, "wb");
+			fwrite("apple,j616s\0apple,t6040\0apple,arm-platform\0", 1, 43, f);
+			fclose(f);
+			CHECK(cdn_config_load_sensor(&c, NULL, compat_j616s, shipped, NULL, 0) == 0);
+			CHECK(!strcmp(c.board, "apple,j616s"));
+			CHECK(c.trig.enter_gain == 3584 && c.trig.exit_gain == 2816);
+			CHECK(c.framing.supported && c.framing.maximum == 6.0f &&
+			      c.framing.default_zoom == 1.5f);
+			CHECK(cdn_config_load_sensor(&c, "", compat_j616s, shipped, NULL, 0) == 0);
+			CHECK(!strcmp(c.board, "apple,j616s"));
+		}
+
+		/* Sensor section wins over [<compatible>] fallback; unknown sensor falls back. */
+		CHECK(cdn_config_load_sensor(&c, "imx958-uw", compat, shipped, NULL, 0) == 0);
+		CHECK(!strcmp(c.board, "sensor:imx958-uw") && c.trig.enter_gain == 3584);
+		CHECK(cdn_config_load_sensor(&c, "imx558", compat, shipped, NULL, 0) == 0);
+		CHECK(!strcmp(c.board, "apple,j700") && c.trig.enter_gain == 2304 && !c.framing.supported);
+
+		/* Synthetic sysfs tree: deferred-start empty -> populated sensor, filtered by driver. */
+		snprintf(sysfs, sizeof(sysfs), "%s/sysfs-test", dir);
+		snprintf(v0_dev, sizeof(v0_dev), "%s/class/video4linux/video0/device", sysfs);
+		snprintf(v0_drv, sizeof(v0_drv), "%s/driver", v0_dev);
+		snprintf(v0_sensor, sizeof(v0_sensor), "%s/sensor", v0_dev);
+		snprintf(v1_dev, sizeof(v1_dev), "%s/class/video4linux/video1/device", sysfs);
+		snprintf(v1_drv, sizeof(v1_drv), "%s/driver", v1_dev);
+		snprintf(v1_sensor, sizeof(v1_sensor), "%s/sensor", v1_dev);
+		mkdir(sysfs, 0755);
+		snprintf(tmp, sizeof(tmp), "%s/class", sysfs); mkdir(tmp, 0755);
+		snprintf(tmp, sizeof(tmp), "%s/class/video4linux", sysfs); mkdir(tmp, 0755);
+		snprintf(tmp, sizeof(tmp), "%s/class/video4linux/video0", sysfs); mkdir(tmp, 0755);
+		mkdir(v0_dev, 0755);
+		snprintf(tmp, sizeof(tmp), "%s/class/video4linux/video1", sysfs); mkdir(tmp, 0755);
+		mkdir(v1_dev, 0755);
+		remove(v0_drv); remove(v1_drv); remove(v0_sensor); remove(v1_sensor);
+		CHECK(symlink("/sys/bus/platform/drivers/uvcvideo", v0_drv) == 0);
+		CHECK(symlink("/sys/bus/platform/drivers/apple-isp", v1_drv) == 0);
+		f = fopen(v0_sensor, "w"); fputs("other-sensor\n", f); fclose(f);
+
+		/* video1 (apple-isp) has no sensor yet (deferred start); video0 (uvcvideo) is ignored. */
+		CHECK(!cdn_v4l2_sensor("/dev/video1", sysfs, sensor, sizeof(sensor)));
+		CHECK(!cdn_sysfs_find_sensor(sysfs, "apple-isp", sensor, sizeof(sensor)));
+		CHECK(cdn_config_load_sensor(&c, sensor, compat, shipped, NULL, 0) == 0);
+		CHECK(!strcmp(c.board, "apple,j700"));
+
+		/* Stream start detects the camera and populates sysfs sensor. */
+		f = fopen(v1_sensor, "w"); fputs("imx958-uw\n", f); fclose(f);
+		CHECK(cdn_v4l2_sensor("/dev/video1", sysfs, sensor, sizeof(sensor)));
+		CHECK(!strcmp(sensor, "imx958-uw"));
+		sensor[0] = 0;
+		CHECK(cdn_sysfs_find_sensor(sysfs, "apple-isp", sensor, sizeof(sensor)));
+		CHECK(!strcmp(sensor, "imx958-uw"));
+		CHECK(cdn_config_load_sensor(&c, sensor, compat, shipped, NULL, 0) == 0);
+		CHECK(!strcmp(c.board, "sensor:imx958-uw") && c.framing.supported);
+
+		remove(v0_sensor); remove(v1_sensor); remove(v0_drv); remove(v1_drv);
+		rmdir(v0_dev); rmdir(v1_dev);
+		snprintf(tmp, sizeof(tmp), "%s/class/video4linux/video0", sysfs); rmdir(tmp);
+		snprintf(tmp, sizeof(tmp), "%s/class/video4linux/video1", sysfs); rmdir(tmp);
+		snprintf(tmp, sizeof(tmp), "%s/class/video4linux", sysfs); rmdir(tmp);
+		snprintf(tmp, sizeof(tmp), "%s/class", sysfs); rmdir(tmp);
+		rmdir(sysfs);
+		remove(compat_m4);
 	}
 	remove(compat); remove(boards); remove(user); remove(bad);
 	printf(fails ? "FAIL\n" : "PASS\n");

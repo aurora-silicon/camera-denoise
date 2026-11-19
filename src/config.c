@@ -1,10 +1,14 @@
 // SPDX-License-Identifier: MIT
 #include <ctype.h>
+#include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "config.h"
 
@@ -124,32 +128,152 @@ static int parse(struct cdn_config *c, const char *path, const char *section, bo
 	return err ? -1 : 0;
 }
 
-int cdn_config_load(struct cdn_config *c, const char *compat_path, const char *boards_path,
-		    const char *const *settings, int nsettings)
+bool cdn_driver_listed(const char *drivers, const char *drv)
 {
-	char compat[1024];
-	size_t n = 0;
-	FILE *f;
+	char buf[128], *save = NULL;
+
+	if (!drivers || !drv || !*drv)
+		return false;
+	snprintf(buf, sizeof(buf), "%s", drivers);
+	for (char *t = strtok_r(buf, ", ", &save); t; t = strtok_r(NULL, ", ", &save))
+		if (!strcmp(t, drv))
+			return true;
+	return false;
+}
+
+bool cdn_v4l2_sensor(const char *v4l2_path, const char *sysfs_root,
+		     char *sensor, size_t sensor_sz)
+{
+	const char *root = sysfs_root && *sysfs_root ? sysfs_root : "/sys";
+	const char *slash, *dev;
+	char path[PATH_MAX], buf[64], *s;
+	ssize_t n;
+	int fd;
+
+	if (!sensor || !sensor_sz)
+		return false;
+	sensor[0] = 0;
+	if (!v4l2_path || !*v4l2_path)
+		return false;
+	slash = strrchr(v4l2_path, '/');
+	dev = slash ? slash + 1 : v4l2_path;
+	if (!*dev || dev[0] == '.')
+		return false;
+	if ((size_t)snprintf(path, sizeof(path), "%s/class/video4linux/%s/device/sensor",
+			     root, dev) >= sizeof(path))
+		return false;
+	fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		return false;
+	n = read(fd, buf, sizeof(buf) - 1);
+	close(fd);
+	if (n <= 0)
+		return false;
+	buf[n] = 0;
+	s = trim(buf);
+	if (!*s || strlen(s) >= sensor_sz)
+		return false;
+	snprintf(sensor, sensor_sz, "%s", s);
+	return true;
+}
+
+bool cdn_sysfs_find_sensor(const char *sysfs_root, const char *drivers,
+			   char *sensor, size_t sensor_sz)
+{
+	const char *root = sysfs_root && *sysfs_root ? sysfs_root : "/sys";
+	char dirpath[PATH_MAX], best_dev[256] = "", best_sensor[64] = "";
+	struct dirent *de;
+	DIR *d;
+
+	if (!sensor || !sensor_sz)
+		return false;
+	sensor[0] = 0;
+	if ((size_t)snprintf(dirpath, sizeof(dirpath), "%s/class/video4linux", root) >=
+	    sizeof(dirpath))
+		return false;
+	d = opendir(dirpath);
+	if (!d)
+		return false;
+	while ((de = readdir(d)) != NULL) {
+		char cand[64];
+
+		if (de->d_name[0] == '.')
+			continue;
+		if (drivers && *drivers) {
+			char lpath[PATH_MAX], target[PATH_MAX];
+			const char *drv;
+			ssize_t ln;
+
+			if ((size_t)snprintf(lpath, sizeof(lpath),
+					     "%s/class/video4linux/%s/device/driver",
+					     root, de->d_name) >= sizeof(lpath))
+				continue;
+			ln = readlink(lpath, target, sizeof(target) - 1);
+			if (ln <= 0)
+				continue;
+			target[ln] = 0;
+			drv = strrchr(target, '/');
+			drv = drv ? drv + 1 : target;
+			if (!cdn_driver_listed(drivers, drv))
+				continue;
+		}
+		if (!cdn_v4l2_sensor(de->d_name, root, cand, sizeof(cand)))
+			continue;
+		if (!best_dev[0] || strcmp(de->d_name, best_dev) < 0) {
+			snprintf(best_dev, sizeof(best_dev), "%s", de->d_name);
+			snprintf(best_sensor, sizeof(best_sensor), "%s", cand);
+		}
+	}
+	closedir(d);
+	if (!best_sensor[0] || strlen(best_sensor) >= sensor_sz)
+		return false;
+	snprintf(sensor, sensor_sz, "%s", best_sensor);
+	return true;
+}
+
+int cdn_config_load_sensor(struct cdn_config *c, const char *sensor,
+			   const char *compat_path, const char *boards_path,
+			   const char *const *settings, int nsettings)
+{
+	bool matched = false;
 
 	defaults(c);
-	f = compat_path ? fopen(compat_path, "rb") : NULL;
-	if (f) {
-		n = fread(compat, 1, sizeof(compat) - 1, f);
-		fclose(f);
-	}
-	compat[n] = 0;
-	/* NUL-separated list, most specific first */
-	for (size_t off = 0; off < n; off += strlen(compat + off) + 1) {
+	if (sensor && *sensor) {
+		char sec[sizeof(c->board)];
 		bool found = false;
-		const char *name = compat + off;
 
-		if (!*name)
-			continue;
-		if (parse(c, boards_path, name, &found))
-			return -1;
-		if (found) {
-			snprintf(c->board, sizeof(c->board), "%s", name);
-			break;
+		if ((size_t)snprintf(sec, sizeof(sec), "sensor:%s", sensor) < sizeof(sec)) {
+			if (parse(c, boards_path, sec, &found))
+				return -1;
+			if (found) {
+				snprintf(c->board, sizeof(c->board), "%s", sec);
+				matched = true;
+			}
+		}
+	}
+	if (!matched) {
+		char compat[1024];
+		size_t n = 0;
+		FILE *f = compat_path ? fopen(compat_path, "rb") : NULL;
+
+		if (f) {
+			n = fread(compat, 1, sizeof(compat) - 1, f);
+			fclose(f);
+		}
+		compat[n] = 0;
+		/* NUL-separated list, most specific first */
+		for (size_t off = 0; off < n; off += strlen(compat + off) + 1) {
+			bool found = false;
+			const char *name = compat + off;
+
+			if (!*name)
+				continue;
+			if (parse(c, boards_path, name, &found))
+				return -1;
+			if (found) {
+				snprintf(c->board, sizeof(c->board), "%s", name);
+				break;
+			}
 		}
 	}
 	for (int i = 0; i < nsettings; i++)
@@ -165,6 +289,12 @@ int cdn_config_load(struct cdn_config *c, const char *compat_path, const char *b
 	if (c->trig.exit_noise > c->trig.enter_noise)
 		c->trig.exit_noise = c->trig.enter_noise;
 	return 0;
+}
+
+int cdn_config_load(struct cdn_config *c, const char *compat_path, const char *boards_path,
+		    const char *const *settings, int nsettings)
+{
+	return cdn_config_load_sensor(c, NULL, compat_path, boards_path, settings, nsettings);
 }
 
 const char *cdn_temporal_backend(const struct cdn_config *c)
