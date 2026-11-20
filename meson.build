@@ -25,7 +25,7 @@ add_project_arguments(
 
 core = static_library('cdn-core',
   'src/backend.c', 'src/cpu/denoise_cpu.c', 'src/trigger.c', 'src/config.c', 'src/gain.c', 'src/effects.c',
-  'src/picture.c',
+  'src/picture.c', 'src/zoom.c',
   dependencies : [threads, dl, m])
 core_dep = declare_dependency(link_with : core, dependencies : [threads, dl, m])
 
@@ -127,3 +127,5 @@ test('config', executable('test_config', 'tests/test_config.c', dependencies : c
 
 test('effects', executable('test_effects', 'tests/test_effects.c', dependencies : core_dep))
 test('picture', executable('test_picture', 'tests/test_picture.c', dependencies : core_dep))
+test('zoom', executable('test_zoom', 'tests/test_zoom.c', dependencies : core_dep))
+executable('aurora-camera-zoom-check', 'tools/cdn-zoom-check.c', dependencies : core_dep, install : true)
