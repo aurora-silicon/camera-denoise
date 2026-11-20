@@ -40,6 +40,7 @@
 #include "gain.h"
 #include "effects.h"
 #include "picture.h"
+#include "zoom.h"
 #include "pipewire-frame.h"
 #include "trigger.h"
 
@@ -96,6 +97,9 @@ struct cam {
 	const struct cdn_backend_ops *ops;
 	void *bstate;
 	struct cdn_effects *effects;
+	struct cdn_zoom *zoom;
+	int zoom_w, zoom_h;
+	bool zoom_failed;
 	struct cdn_picture *picture; /* vignette and picture controls, last */
 	struct ce_config effect_cfg;
 	/* the low-light stage on top of the temporal one, if a plugin runs */
@@ -485,6 +489,30 @@ static void on_in_process(void *data)
 			cdn_picture_apply(c->picture, &c->app->cfg.picture, &fo);
 	}
 
+	/*
+	 * Digital zoom without the effects plugin (which zooms itself): the
+	 * stream's camera.zoom control, else the settings' zoom. The crop and
+	 * the scaling run on the SoC's scaler when there is one (zoom.h).
+	 */
+	float zoom = c->effect_cfg.zoom > 0 ? c->effect_cfg.zoom : c->app->cfg.zoom;
+	if (!c->effects && zoom > 1.0f) {
+		if (c->zoom && (fo.width != c->zoom_w || fo.height != c->zoom_h)) {
+			cdn_zoom_free(c->zoom);
+			c->zoom = NULL;
+		}
+		if (!c->zoom && !c->zoom_failed) {
+			const char *e = c->app->cfg.zoom_engine;
+			c->zoom = cdn_zoom_new(fo.width, fo.height,
+					       !strcmp(e, "cpu") ? CDN_ZOOM_CPU :
+					       !strcmp(e, "scaler") ? CDN_ZOOM_SCALER : CDN_ZOOM_AUTO);
+			c->zoom_w = fo.width;
+			c->zoom_h = fo.height;
+			c->zoom_failed = !c->zoom;
+		}
+		if (c->zoom)
+			cdn_zoom_apply(c->zoom, &fo, cdn_zoom_rect(fo.width, fo.height, zoom));
+	}
+
 	uint64_t result_pts = ih && ih->pts > 0 ? (uint64_t)ih->pts : 0;
 	uint64_t result_seq = ih ? ih->seq : c->frames;
 	bool ready = true;
@@ -668,6 +696,9 @@ static void cam_stop_input(struct cam *c)
 {
 	cdn_effects_free(c->effects);
 	c->effects = NULL;
+	cdn_zoom_free(c->zoom);
+	c->zoom = NULL;
+	c->zoom_failed = false;
 	if (!c->in)
 		return;
 	spa_hook_remove(&c->in_listener);
@@ -1002,6 +1033,7 @@ static void cam_destroy(struct cam *c)
 	free(c->copy);
 	free(c->stage);
 	cdn_picture_destroy(c->picture);
+	cdn_zoom_free(c->zoom);
 	spa_list_remove(&c->link);
 	free(c);
 }

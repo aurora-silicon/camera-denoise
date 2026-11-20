@@ -48,6 +48,13 @@ struct cdn_config {
 	int temporal_frames;
 	/* the picture stage after the denoiser (picture.h): all neutral by default */
 	struct cdn_picture_cfg picture;
+	/*
+	 * Digital zoom without the effects plugin (zoom.h): a centred crop scaled
+	 * back to the stream's size, 1 = off. A stream's camera.zoom control wins.
+	 * zoom_engine: auto (the SoC scaler when present, else the CPU), cpu, scaler.
+	 */
+	float zoom;
+	char zoom_engine[8];
 	char drivers[128];	/* V4L2 drivers whose sources get a filter */
 	char board[64];		/* matched compatible, "" if none */
 };

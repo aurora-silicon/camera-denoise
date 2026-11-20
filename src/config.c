@@ -20,6 +20,8 @@ static void defaults(struct cdn_config *c)
 	c->spatial = 1.0f;
 	c->temporal_frames = 8;
 	cdn_picture_defaults(&c->picture);
+	c->zoom = 1.0f;
+	snprintf(c->zoom_engine, sizeof(c->zoom_engine), "auto");
 	snprintf(c->backend, sizeof(c->backend), "auto");
 	snprintf(c->prefer, sizeof(c->prefer), "ane");
 	snprintf(c->drivers, sizeof(c->drivers), "apple-isp");
@@ -92,6 +94,12 @@ static int set_key(struct cdn_config *c, const char *k, const char *v, bool sett
 	else if (settings && !strcmp(k, "warmth") && num && d >= -1 && d <= 1) c->picture.warmth = (float)d;
 	else if (settings && !strcmp(k, "tint") && num && d >= -1 && d <= 1) c->picture.tint = (float)d;
 	else if (settings && !strcmp(k, "sharpen") && num && d >= 0 && d <= 1) c->picture.sharpen = (float)d;
+	else if (settings && !strcmp(k, "zoom") && num && d >= 1 && d <= 6) c->zoom = (float)d;
+	else if (settings && !strcmp(k, "zoom-engine")) {
+		if (strcmp(v, "auto") && strcmp(v, "cpu") && strcmp(v, "scaler"))
+			return -1;
+		snprintf(c->zoom_engine, sizeof(c->zoom_engine), "%s", v);
+	}
 	else if (settings && !strcmp(k, "drivers")) snprintf(c->drivers, sizeof(c->drivers), "%s", v);
 	else return -1;
 	return 0;
