@@ -209,12 +209,20 @@ struct apple_portrait {
 	float *guide, *alpha, *skin;       /* qw x qh */
 	float *t0, *t1, *t2, *t3, *t4;     /* scratch, qw x qh */
 	float *by, *bu, *bv;               /* blurred background, qw x qh */
+	float *qs;                         /* the CPU's quarter-size sums, 4 x qw x qh */
 	/* four quarter-size rows (vertical interpolation) */
 	float *r0, *r1, *r2, *r3;
 	float *f0, *f1, *f2;               /* full-width rows */
 	uint8_t lut[64][256];              /* Studio Light curve per light level */
 	float lut_gain;                    /* the key gain the curves are for */
 	float face_luma;                   /* the face's mean luma, smoothed; < 0 = none yet */
+	/* Studio Light's head, smoothed over frames (the per-frame box jitters,
+	 * which showed as the light blinking with the other effects on), and how
+	 * much of the head-shaped light is on (0..1: fades out over ~0.5 s when
+	 * the head is lost, back in as fast when it returns; a head that comes
+	 * back after a full fade-out is lit at once) */
+	float lhx, lht, lhh, lhave;
+	float light_g;                     /* the key gain of the last light_prepare */
 };
 
 /* bilinear taps at quarter-size coordinate q (pixel centres at +0.5) */
@@ -254,12 +262,14 @@ struct apple_portrait *apple_portrait_new(int width, int height)
 	p->f0 = calloc((size_t)width + 4, sizeof(float));
 	p->f1 = calloc((size_t)width + 4, sizeof(float));
 	p->f2 = calloc((size_t)width + 4, sizeof(float));
-	if (!p->r0 || !p->r1 || !p->r2 || !p->r3 || !p->f0 || !p->f1 || !p->f2) {
+	p->qs = calloc(4 * n, sizeof(float));
+	if (!p->r0 || !p->r1 || !p->r2 || !p->r3 || !p->f0 || !p->f1 || !p->f2 || !p->qs) {
 		apple_portrait_free(p);
 		return NULL;
 	}
 	p->lut_gain = -1;
 	p->face_luma = -1;
+	p->lhave = 0;
 	return p;
 }
 
@@ -272,6 +282,7 @@ void apple_portrait_free(struct apple_portrait *p)
 	free(p->by); free(p->bu); free(p->bv);
 	free(p->r0); free(p->r1); free(p->r2); free(p->r3);
 	free(p->f0); free(p->f1); free(p->f2);
+	free(p->qs);
 	free(p);
 }
 
@@ -383,26 +394,79 @@ static void guided(struct apple_portrait *p, const float *in, float *out, int r,
 		out[i] = clampf(cov[i] * p->guide[i] + var[i], 0, 1);
 }
 
+/*
+ * The frame's quarter-size sums, the only full-size reads of refine and
+ * blur_prepare: per quarter pixel the 4 x 4 luma sum over the pixels inside
+ * the frame (the refine guide), the 4 x 4 luma and 2 x 2 chroma sums with
+ * the edge pixels repeated (the blur planes). Whole numbers, so the GPU's
+ * (apple_gpu_quarter()) are the same bit for bit.
+ */
+void apple_portrait_quarter(struct apple_portrait *p, const struct cdn_frame *f,
+			    struct apple_quarter *q)
+{
+	int w = p->qw, h = p->qh;
+	size_t n = (size_t)w * h;
+	float *gs = p->qs, *ys = gs + n, *us = ys + n, *vs = us + n;
+
+	for (int y = 0; y < h; y++)
+		for (int x = 0; x < w; x++) {
+			int g = 0, l = 0, u = 0, v = 0;
+
+			for (int j = 0; j < 4; j++) {
+				int py = y * 4 + j, cy = clampi(py, 0, f->height - 1);
+				const uint8_t *row = f->y + (size_t)cy * f->stride_y;
+
+				for (int i = 0; i < 4; i++) {
+					int px = x * 4 + i;
+
+					l += row[clampi(px, 0, f->width - 1)];
+					if (py < f->height && px < f->width)
+						g += row[px];
+				}
+			}
+			for (int j = 0; j < 2; j++) {
+				int cy = clampi(y * 2 + j, 0, f->height / 2 - 1);
+				const uint8_t *row = f->uv + (size_t)cy * f->stride_uv;
+
+				for (int i = 0; i < 2; i++) {
+					int cx = clampi(x * 2 + i, 0, f->width / 2 - 1);
+
+					u += row[2 * cx];
+					v += row[2 * cx + 1];
+				}
+			}
+			size_t o = (size_t)y * w + x;
+
+			gs[o] = (float)g;
+			ys[o] = (float)l;
+			us[o] = (float)u;
+			vs[o] = (float)v;
+		}
+	*q = (struct apple_quarter){ gs, ys, us, vs };
+}
+
 void apple_portrait_refine(struct apple_portrait *p, const struct apple_masks *m,
 			   const struct cdn_frame *f)
+{
+	struct apple_quarter q;
+
+	apple_portrait_quarter(p, f, &q);
+	apple_portrait_refine_q(p, m, &q);
+}
+
+void apple_portrait_refine_q(struct apple_portrait *p, const struct apple_masks *m,
+			     const struct apple_quarter *q)
 {
 	int w = p->qw, h = p->qh;
 
 	for (int y = 0; y < h; y++) {
+		int rows = p->height - y * 4 < 4 ? p->height - y * 4 : 4;
+
 		for (int x = 0; x < w; x++) {
-			int sum = 0, cnt = 0;
+			int cols = p->width - x * 4 < 4 ? p->width - x * 4 : 4, cnt = rows * cols;
+			size_t o = (size_t)y * w + x;
 
-			for (int j = 0; j < 4; j++) {
-				int py = y * 4 + j;
-
-				if (py >= f->height)
-					break;
-				const uint8_t *row = f->y + (size_t)py * f->stride_y;
-
-				for (int i = 0; i < 4 && x * 4 + i < f->width; i++, cnt++)
-					sum += row[x * 4 + i];
-			}
-			p->guide[(size_t)y * w + x] = cnt ? sum / (255.0f * cnt) : 0;
+			p->guide[o] = cnt > 0 ? q->gsum[o] / (255.0f * cnt) : 0;
 		}
 	}
 	float sx = (float)APPLE_SEG_W / w, sy = (float)APPLE_SEG_H / h;
@@ -478,7 +542,16 @@ static inline uint8_t u8v(float v)
 	return (uint8_t)(fminf(fmaxf(v, 0.0f), 255.0f) + 0.5f);
 }
 
-void apple_portrait_blur(struct apple_portrait *p, struct cdn_frame *f, float strength)
+void apple_portrait_blur_prepare(struct apple_portrait *p, const struct cdn_frame *f, float strength)
+{
+	struct apple_quarter q;
+
+	apple_portrait_quarter(p, f, &q);
+	apple_portrait_blur_prepare_q(p, &q, strength);
+}
+
+void apple_portrait_blur_prepare_q(struct apple_portrait *p, const struct apple_quarter *q,
+				   float strength)
 {
 	int w = p->qw, h = p->qh;
 	size_t n = (size_t)w * h;
@@ -488,42 +561,18 @@ void apple_portrait_blur(struct apple_portrait *p, struct cdn_frame *f, float st
 	 * 4 + 20 x strength (other widths scale). Three box passes of radius q
 	 * at quarter size give sigma^2 = q (q + 1) quarter pixels.
 	 */
-	float sigma_q = (4 + 20 * clampf(strength, 0, 1)) * f->width / 1280.0f / 4;
+	float sigma_q = (4 + 20 * clampf(strength, 0, 1)) * p->width / 1280.0f / 4;
 	int pass_r = (int)lroundf(sqrtf(sigma_q * sigma_q + 0.25f) - 0.5f);
 
 	if (pass_r < 1)
 		pass_r = 1;
 
 	/* quarter-size planes of the frame: area averages (4 x 4 luma, 2 x 2 chroma) */
-	for (int y = 0; y < h; y++)
-		for (int x = 0; x < w; x++) {
-			float sy = 0, su = 0, sv = 0;
-			int ny = 0, nc = 0;
-
-			for (int j = 0; j < 4; j++) {
-				int py = clampi(y * 4 + j, 0, f->height - 1);
-				const uint8_t *row = f->y + (size_t)py * f->stride_y;
-
-				for (int i = 0; i < 4; i++, ny++)
-					sy += row[clampi(x * 4 + i, 0, f->width - 1)];
-			}
-			for (int j = 0; j < 2; j++) {
-				int cy = clampi(y * 2 + j, 0, f->height / 2 - 1);
-				const uint8_t *row = f->uv + (size_t)cy * f->stride_uv;
-
-				for (int i = 0; i < 2; i++, nc++) {
-					int cx = clampi(x * 2 + i, 0, f->width / 2 - 1);
-
-					su += row[2 * cx];
-					sv += row[2 * cx + 1];
-				}
-			}
-			size_t o = (size_t)y * w + x;
-
-			p->by[o] = sy / ny;
-			p->bu[o] = su / nc;
-			p->bv[o] = sv / nc;
-		}
+	for (size_t i = 0; i < n; i++) {
+		p->by[i] = q->ysum[i] / 16;
+		p->bu[i] = q->usum[i] / 4;
+		p->bv[i] = q->vsum[i] / 4;
+	}
 	/* normalized convolution of the background only: no halo from the person */
 	for (size_t i = 0; i < n; i++)
 		wt[i] = 1.0f - p->alpha[i];
@@ -543,7 +592,13 @@ void apple_portrait_blur(struct apple_portrait *p, struct cdn_frame *f, float st
 		for (size_t i = 0; i < n; i++)
 			pl[i] = den[i] > 1e-3f ? num[i] / den[i] : pl[i];
 	}
-	/* composite at full size: a = person, kept sharp (a > 0.995 counts as 1) */
+}
+
+/* composite at full size: a = person, kept sharp (a > 0.995 counts as 1) */
+void apple_portrait_blur_apply(struct apple_portrait *p, struct cdn_frame *f)
+{
+	int w = p->qw, h = p->qh;
+
 	for (int y = 0; y < f->height; y++) {
 		uint8_t *row = f->y + (size_t)y * f->stride_y;
 		float qy = (y + 0.5f) / 4, *fa = p->f0, *fb = p->f1;
@@ -598,6 +653,9 @@ void apple_portrait_blur(struct apple_portrait *p, struct cdn_frame *f, float st
 #define LIGHT_TARGET 0.5f
 #define LIGHT_MAX_BOOST 0.55f
 #define LIGHT_MIN_BOOST 0.08f
+/* Studio Light's head: per-frame follow rate and fade step (frames at 30 fps) */
+#define LIGHT_FOLLOW 0.2f
+#define LIGHT_FADE (1.0f / 15)
 #define LIGHT_BG_DIM 0.18f
 
 /* y * g, rolled off towards 1: identity at g = 1, f(1) = 1, monotonic for g <= 2 */
@@ -606,8 +664,8 @@ static float light_curve(float y, float g)
 	return y * g / (1 + (g - 1) * y * y);
 }
 
-void apple_portrait_light(struct apple_portrait *p, struct cdn_frame *f,
-			  const struct apple_subject *s, float strength)
+bool apple_portrait_light_prepare(struct apple_portrait *p, const struct apple_subject *s,
+				  float strength)
 {
 	int w = p->qw, h = p->qh;
 	size_t n = (size_t)w * h;
@@ -616,7 +674,7 @@ void apple_portrait_light(struct apple_portrait *p, struct cdn_frame *f,
 	bool head = s && s->present;
 
 	if (k <= 0)
-		return;
+		return false;
 	/* the face's mean luma: skin inside the person, in the head's box */
 	if (head) {
 		int hx0 = clampi((int)((s->head_x - s->head_h * 0.6f * h / w) * w), 0, w - 1);
@@ -665,9 +723,28 @@ void apple_portrait_light(struct apple_portrait *p, struct cdn_frame *f,
 	float hx = 0, hy = 0, rx = 1, ry = 1;
 
 	if (head) {
-		hx = s->head_x * w;
-		hy = (s->head_top + 0.6f * s->head_h) * h;
-		ry = fmaxf(1.6f * s->head_h * h, 2);
+		if (p->lhave <= 0) {
+			/* first sight, or back after a full fade-out: lit at once */
+			p->lhx = s->head_x;
+			p->lht = s->head_top;
+			p->lhh = s->head_h;
+			p->lhave = 1;
+		} else {
+			/* ~0.15 s at 30 fps: follows a move, drops the frame-to-frame jitter */
+			p->lhx += LIGHT_FOLLOW * (s->head_x - p->lhx);
+			p->lht += LIGHT_FOLLOW * (s->head_top - p->lht);
+			p->lhh += LIGHT_FOLLOW * 0.5f * (s->head_h - p->lhh);
+		}
+		p->lhave = fminf(p->lhave + LIGHT_FADE, 1);
+	} else {
+		p->lhave = fmaxf(p->lhave - LIGHT_FADE, 0);
+	}
+	bool shaped = p->lhave > 0;
+
+	if (shaped) {
+		hx = p->lhx * w;
+		hy = (p->lht + 0.6f * p->lhh) * h;
+		ry = fmaxf(1.6f * p->lhh * h, 2);
 		rx = fmaxf(ry * 1.1f, 2);
 	}
 	for (int y = 0; y < h; y++)
@@ -675,10 +752,10 @@ void apple_portrait_light(struct apple_portrait *p, struct cdn_frame *f,
 			size_t o = (size_t)y * w + x;
 			float fall = 0.35f;
 
-			if (head) {
+			if (shaped) {
 				float dx = (x + 0.5f - hx) / rx, dy = (y + 0.5f - hy) / ry;
 
-				fall = 0.35f + 0.65f * expf(-(dx * dx + dy * dy));
+				fall = 0.35f + 0.65f * p->lhave * expf(-(dx * dx + dy * dy));
 			}
 			light[o] = clampf(soft[o] * fall, 0, 1);
 			/* the background: dimmer towards the edges (r^2 = 1 in the corners) */
@@ -688,6 +765,16 @@ void apple_portrait_light(struct apple_portrait *p, struct cdn_frame *f,
 			bg[o] = 1 - k * LIGHT_BG_DIM * vig * (1 - soft[o]);
 		}
 	(void)n;
+	p->light_g = g;
+	return true;
+}
+
+/* The light maps of apple_portrait_light_prepare() on the frame, at full size. */
+void apple_portrait_light_apply(struct apple_portrait *p, struct cdn_frame *f)
+{
+	int w = p->qw, h = p->qh;
+	float *light = p->t0, *bg = p->t2, g = p->light_g;
+
 	for (int y = 0; y < f->height; y++) {
 		uint8_t *row = f->y + (size_t)y * f->stride_y;
 		float qy = (y + 0.5f) / 4, *fl = p->f0, *fd = p->f1;
@@ -719,4 +806,25 @@ void apple_portrait_light(struct apple_portrait *p, struct cdn_frame *f,
 			row[2 * x + 1] = u8v(128 + (row[2 * x + 1] - 128) * sat);
 		}
 	}
+}
+
+void apple_portrait_blur(struct apple_portrait *p, struct cdn_frame *f, float strength)
+{
+	apple_portrait_blur_prepare(p, f, strength);
+	apple_portrait_blur_apply(p, f);
+}
+
+void apple_portrait_light(struct apple_portrait *p, struct cdn_frame *f,
+			  const struct apple_subject *s, float strength)
+{
+	if (apple_portrait_light_prepare(p, s, strength))
+		apple_portrait_light_apply(p, f);
+}
+
+void apple_portrait_maps(const struct apple_portrait *p, struct apple_fx_maps *m)
+{
+	*m = (struct apple_fx_maps) {
+		.qw = p->qw, .qh = p->qh, .alpha = p->alpha, .by = p->by, .bu = p->bu,
+		.bv = p->bv, .light = p->t0, .bg = p->t2, .lut = &p->lut[0][0], .g = p->light_g,
+	};
 }

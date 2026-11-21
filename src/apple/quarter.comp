@@ -1,0 +1,55 @@
+// SPDX-License-Identifier: MIT
+// The frame's quarter-size sums on the GPU, the only full-size reads of
+// Portrait's refine and blur: per quarter pixel the 4 x 4 luma sum over the
+// pixels inside the frame (the refine guide), the 4 x 4 luma and 2 x 2 chroma
+// sums with the edge pixels repeated (the blur planes). Whole numbers, the
+// same as portrait.c's apple_portrait_quarter() bit for bit.
+#version 450
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer Frame { uint px[]; };  // Y rows then UV rows, stride bytes each
+layout(std430, binding = 3) writeonly buffer Quarter { float q[]; }; // gsum, ysum, usum, vsum (qw x qh each)
+
+layout(push_constant) uniform P {
+	int w, h, stride, qw, qh;
+	int blur, light;
+	float g;
+} pc;
+
+uint byte_at(int off)
+{
+	return (px[off >> 2] >> (8u * uint(off & 3))) & 0xffu;
+}
+
+void main()
+{
+	int n = pc.qw * pc.qh;
+	int i = int(gl_GlobalInvocationID.x);
+	if (i >= n)
+		return;
+	int y = i / pc.qw, x = i % pc.qw;
+	uint gs = 0u, ys = 0u, us = 0u, vs = 0u;
+
+	for (int j = 0; j < 4; j++) {
+		int py = y * 4 + j, cy = clamp(py, 0, pc.h - 1);
+		for (int k = 0; k < 4; k++) {
+			int sx = x * 4 + k;
+			ys += byte_at(cy * pc.stride + clamp(sx, 0, pc.w - 1));
+			if (py < pc.h && sx < pc.w)
+				gs += byte_at(py * pc.stride + sx);
+		}
+	}
+	for (int j = 0; j < 2; j++) {
+		int cy = clamp(y * 2 + j, 0, pc.h / 2 - 1);
+		for (int k = 0; k < 2; k++) {
+			int cx = clamp(x * 2 + k, 0, pc.w / 2 - 1);
+			int o = (pc.h + cy) * pc.stride + 2 * cx;
+			us += byte_at(o);
+			vs += byte_at(o + 1);
+		}
+	}
+	q[i] = float(gs);
+	q[n + i] = float(ys);
+	q[2 * n + i] = float(us);
+	q[3 * n + i] = float(vs);
+}

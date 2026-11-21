@@ -14,17 +14,24 @@
  * over 1.5 s; nobody for 5 s: home over 5 s; heads under 1.5 % are ignored;
  * moves under 0.2 of the head are "still".
  *
- * Ours, not Apple's: face_fov and max_fov. The plist's viewport is a share of
- * the sensor's width; the Linux frame is a 16:9 crop of that width, so a head
- * at laptop distance is 0.3-0.45 of the frame high. face_fov 1.8 puts a 0.38
- * head at the default viewport; one person is never framed wider than
- * max_fov, so there is always room to follow them (+-0.14 of the frame) (2026-11-21: with 4.5 and
- * no cap the viewport grew to the whole frame and Center Stage stopped).
+ * The plist's viewport is a share of the sensor's width. The Linux frame is
+ * already a crop of it: the lens-circle crop takes 1242 of the 1520 binned
+ * columns (0.82). So Apple's default 0.68 is 0.83 of our frame and its
+ * minimum 0.34 is 0.42 (2026-11-21 round 3: with 0.68/0.5 used as is the
+ * viewport sat at 0.5, a 2x zoom, "still zooming too much").
+ *
+ * Ours, not Apple's: face_fov and max_fov. A head at laptop distance is
+ * 0.15-0.20 of our frame high (the 2026-11-21 run); face_fov 4.4 puts a 0.19
+ * head at the default.
+ * One person is never framed wider than max_fov, so there is always room to
+ * follow them (2026-11-21: with no cap the viewport grew to the whole frame
+ * and Center Stage stopped). min_fov stays above Apple's 0.42: one person
+ * at a laptop is not framed tighter than 1.4x.
  */
 void apple_framing_params_default(struct apple_framing_params *p)
 {
 	*p = (struct apple_framing_params) {
-		.default_fov = 0.68f, .min_fov = 0.5f,
+		.default_fov = 0.83f, .min_fov = 0.7f,
 		.deadband_w = 0.6f, .deadband_h = 0.3f,
 		.group_deadband_w = 0.8f, .group_deadband_h = 0.5f,
 		.top_offset = 0.15f, .group_width = 0.8f,
@@ -34,7 +41,7 @@ void apple_framing_params_default(struct apple_framing_params *p)
 		.recenter_idle_s = 5.0f, .recenter_s = 1.5f,
 		.no_subject_wait_s = 5.0f, .no_subject_return_s = 5.0f,
 		.tiny_head = 0.015f, .movement_tolerance = 0.2f,
-		.face_fov = 1.8f, .max_fov = 0.72f,
+		.face_fov = 4.4f, .max_fov = 0.86f,
 	};
 }
 
@@ -43,7 +50,7 @@ void apple_framing_params_default(struct apple_framing_params *p)
 #define ACCEL_BASE 1.0f
 /* Smoothing of the per-frame subject box (seconds); the head size, which
  * sets the zoom, more (a size jitter shows as pumping). */
-#define SUBJECT_TAU 0.25f
+#define SUBJECT_TAU 0.35f
 #define SIZE_TAU 0.8f
 /* the target size changes only when the wanted one differs by more than this */
 #define SIZE_HYSTERESIS 0.15f
@@ -139,8 +146,10 @@ static void axis(float *p, float *v, float target, float smooth, float vmax, flo
 	nv = clampf(nv, *v - amax * dt, *v + amax * dt);
 	nv = clampf(nv, -vmax, vmax);
 	np = *p + nv * dt;
-	/* no overshoot */
-	if ((target - *p > 0) == (np > target)) {
+	/* no overshoot; and settle once within ~1 px at rest, or the crop keeps
+	 * creeping by 2-pixel steps for seconds at the tail of the spring */
+	if ((target - *p > 0) == (np > target) ||
+	    (fabsf(target - np) < 0.0015f && fabsf(nv) < 0.01f)) {
 		np = target;
 		nv = 0;
 	}

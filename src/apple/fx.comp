@@ -1,0 +1,99 @@
+// SPDX-License-Identifier: MIT
+// Apple effects' full-size composite on the GPU: Portrait's blurred background
+// behind the person, then Studio Light's gain map, on an NV12 frame in place.
+// The same arithmetic as portrait.c's apple_portrait_blur_apply() and
+// apple_portrait_light_apply() (bilinear quarter-size maps, edges clamped, the
+// same rounding after each effect), so the two paths agree to +-1.
+#version 450
+layout(local_size_x = 64) in;
+// 0 = luma: one invocation per 4 bytes of a Y row; 1 = chroma: per 2 UV pairs.
+layout(constant_id = 0) const int PLANE = 0;
+
+layout(std430, binding = 0) buffer Frame { uint px[]; };      // Y rows then UV rows, stride bytes each
+layout(std430, binding = 1) readonly buffer Maps { float m[]; }; // alpha, by, bu, bv, light, bg (qw x qh each)
+layout(std430, binding = 2) readonly buffer Lut { uint lut[]; }; // 64 x 256 bytes
+
+layout(push_constant) uniform P {
+	int w, h, stride, qw, qh;
+	int blur, light;
+	float g;
+} pc;
+
+float tap(int plane, int x, int y)
+{
+	return m[plane * pc.qw * pc.qh + clamp(y, 0, pc.qh - 1) * pc.qw + clamp(x, 0, pc.qw - 1)];
+}
+
+// bilinear at quarter-size coordinate (qx, qy), texel centres at integers
+float sample_map(int plane, float qx, float qy)
+{
+	float fx = floor(qx), fy = floor(qy);
+	int x0 = int(fx), y0 = int(fy);
+	float ax = clamp(qx - fx, 0.0, 1.0), ay = clamp(qy - fy, 0.0, 1.0);
+	// at the edges the clamped neighbour equals the centre, as in portrait.c
+	if (x0 < 0) { x0 = 0; ax = 0.0; }
+	if (y0 < 0) { y0 = 0; ay = 0.0; }
+	float a = tap(plane, x0, y0), b = tap(plane, x0 + 1, y0);
+	float c = tap(plane, x0, y0 + 1), d = tap(plane, x0 + 1, y0 + 1);
+	float top = a + (b - a) * ax, bot = c + (d - c) * ax;
+	return top + (bot - top) * ay;
+}
+
+float u8v(float v) { return floor(clamp(v, 0.0, 255.0) + 0.5); }
+
+uint lut_at(int level, uint v)
+{
+	uint i = uint(level) * 256u + v;
+	return (lut[i >> 2] >> (8u * (i & 3u))) & 0xffu;
+}
+
+void main()
+{
+	int per_row = (pc.w + 3) / 4;
+	int rows = PLANE == 0 ? pc.h : pc.h / 2;
+	int i = int(gl_GlobalInvocationID.x);
+	if (i >= per_row * rows)
+		return;
+	int y = i / per_row, x4 = (i % per_row) * 4;
+	int base = (PLANE == 0 ? y : pc.h + y) * pc.stride + x4;
+	uint word = px[base >> 2], out_word = word;
+
+	for (int k = 0; k < 4; k++) {
+		int x = x4 + k;
+		if (x >= pc.w)
+			break;
+		float v = float((word >> (8u * uint(k))) & 0xffu);
+		// luma pixel x sits at quarter (x + 0.5) / 4 - 0.5; chroma pair cx at (cx + 0.5) / 2 - 0.5
+		float qx, qy;
+		int plane_b;
+		if (PLANE == 0) {
+			qx = (float(x) + 0.5) / 4.0 - 0.5;
+			qy = (float(y) + 0.5) / 4.0 - 0.5;
+			plane_b = 1;
+		} else {
+			int cx = x >> 1;
+			qx = (float(cx) + 0.5) / 2.0 - 0.5;
+			qy = (float(y) + 0.5) / 2.0 - 0.5;
+			plane_b = 2 + (x & 1);
+		}
+		if (pc.blur != 0) {
+			float a = sample_map(0, qx, qy);
+			if (a > 0.995)
+				a = 1.0;
+			float b = sample_map(plane_b, qx, qy);
+			v = u8v(b + a * (v - b));
+		}
+		if (pc.light != 0) {
+			float fl = sample_map(4, qx, qy), fd = sample_map(5, qx, qy);
+			if (PLANE == 0) {
+				int li = int(clamp(fl, 0.0, 1.0) * 63.0 + 0.5);
+				v = u8v(float(lut_at(li, uint(v))) * fd);
+			} else {
+				float sat = (1.0 + 0.5 * (pc.g - 1.0) * fl) * fd;
+				v = u8v(128.0 + (v - 128.0) * sat);
+			}
+		}
+		out_word = (out_word & ~(0xffu << (8u * uint(k)))) | (uint(v) << (8u * uint(k)));
+	}
+	px[base >> 2] = out_word;
+}

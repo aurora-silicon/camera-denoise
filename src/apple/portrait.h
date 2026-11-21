@@ -52,4 +52,38 @@ void apple_portrait_light(struct apple_portrait *p, struct cdn_frame *f,
 /* The refined person alpha at quarter size (for tests). */
 const float *apple_portrait_alpha(const struct apple_portrait *p, int *w, int *h);
 
+/*
+ * The same effects in two steps, for a composite elsewhere (the GPU): the
+ * quarter-size maps from the frame as it came in, then the full-size
+ * composite. Blur first, light on the blurred picture, as above. All maps
+ * qw x qh floats; lut = 64 x 256 bytes (light level x luma).
+ */
+#include <stdbool.h>
+void apple_portrait_blur_prepare(struct apple_portrait *p, const struct cdn_frame *f, float strength);
+/*
+ * refine and blur_prepare split at their only full-size reads: the frame's
+ * quarter-size sums (qw x qh floats each), from apple_portrait_quarter() on
+ * the CPU or apple_gpu_quarter() on the GPU (the same numbers).
+ */
+struct apple_quarter {
+	const float *gsum, *ysum, *usum, *vsum;
+};
+void apple_portrait_quarter(struct apple_portrait *p, const struct cdn_frame *f,
+			    struct apple_quarter *q);
+void apple_portrait_refine_q(struct apple_portrait *p, const struct apple_masks *m,
+			     const struct apple_quarter *q);
+void apple_portrait_blur_prepare_q(struct apple_portrait *p, const struct apple_quarter *q,
+				   float strength);
+void apple_portrait_blur_apply(struct apple_portrait *p, struct cdn_frame *f);
+bool apple_portrait_light_prepare(struct apple_portrait *p, const struct apple_subject *s,
+				  float strength);
+void apple_portrait_light_apply(struct apple_portrait *p, struct cdn_frame *f);
+struct apple_fx_maps {
+	int qw, qh;
+	const float *alpha, *by, *bu, *bv, *light, *bg;
+	const uint8_t *lut;
+	float g;
+};
+void apple_portrait_maps(const struct apple_portrait *p, struct apple_fx_maps *m);
+
 #endif

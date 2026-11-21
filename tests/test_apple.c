@@ -71,12 +71,12 @@ static void test_framing(void)
 	struct apple_framing f;
 	struct apple_viewport v;
 	struct apple_subject s = { .present = true, .people = 1, .x0 = 0.6f, .y0 = 0.3f,
-				   .x1 = 0.8f, .y1 = 1.0f, .head_x = 0.7f, .head_top = 0.3f,
-				   .head_h = 0.34f };
+				   .x1 = 0.8f, .y1 = 1.0f, .head_x = 0.7f, .head_top = 0.2f,
+				   .head_h = 0.17f };
 	int x, y, w, h;
 
 	apple_framing_init(&f, NULL, 0);
-	assert(fabsf(f.pos.size - 0.68f) < 1e-4f && f.pos.cx == 0.5f);
+	assert(fabsf(f.pos.size - 0.83f) < 1e-4f && f.pos.cx == 0.5f);
 	/* move towards the subject, smoothly (speed and acceleration caps) */
 	float last = f.pos.cx, max_step = 0;
 
@@ -87,10 +87,17 @@ static void test_framing(void)
 	}
 	assert(fabsf(v.cx - fminf(0.7f, 1 - v.size / 2)) < 0.01f);
 	assert(max_step <= 0.25f * 2.0f / 30 + 1e-4f);
-	/* head 0.34 high: viewport 1.8 x head, clamped to [0.34, 0.72] for one person */
-	assert(fabsf(v.size - 0.612f) < 0.02f);
+	/* head 0.17 high: viewport 4.4 x head, clamped to [0.7, 0.86] for one person */
+	assert(fabsf(v.size - 0.748f) < 0.02f);
 	/* the head top sits about 0.15 of the viewport below its top */
 	assert(fabsf((s.head_top - (v.cy - v.size / 2)) / v.size - 0.15f) < 0.05f);
+	/* at rest the viewport stops: no 2-pixel creep at the tail of the spring */
+	{
+		struct apple_viewport a = apple_framing_step(&f, &s, 1.0f / 30);
+		struct apple_viewport b = apple_framing_step(&f, &s, 1.0f / 30);
+
+		assert(a.cx == b.cx && a.cy == b.cy && a.size == b.size);
+	}
 	/* small moves inside the deadband do not move the viewport */
 	struct apple_viewport before = v;
 
@@ -104,12 +111,12 @@ static void test_framing(void)
 	assert(fabsf(v.cx - before.cx) < 1e-3f);
 	for (int i = 0; i < 30 * 10; i++)
 		v = apple_framing_step(&f, NULL, 1.0f / 30);
-	assert(fabsf(v.cx - 0.5f) < 0.01f && fabsf(v.size - 0.68f) < 0.01f);
+	assert(fabsf(v.cx - 0.5f) < 0.01f && fabsf(v.size - 0.83f) < 0.01f);
 	/* crop rectangle: even, inside, the viewport's size */
 	apple_framing_crop(&v, 1920, 1080, &x, &y, &w, &h);
 	assert(!(x & 1) && !(y & 1) && !(w & 1) && !(h & 1));
 	assert(x >= 0 && y >= 0 && x + w <= 1920 && y + h <= 1080);
-	assert(abs(w - (int)(0.68f * 1920)) <= 2 && abs(h - (int)(0.68f * 1080)) <= 2);
+	assert(abs(w - (int)(0.83f * 1920)) <= 2 && abs(h - (int)(0.83f * 1080)) <= 2);
 	/* close to the camera (a head 0.45 of the frame): still a crop, and it
 	 * follows the head across the frame (2026-11-21: it grew to the whole
 	 * frame and stopped) */
@@ -119,7 +126,7 @@ static void test_framing(void)
 	s.head_top = 0.15f;
 	for (int i = 0; i < 90; i++)
 		v = apple_framing_step(&f, &s, 1.0f / 30);
-	assert(v.size <= 0.72f + 1e-3f && v.size > 0.6f);
+	assert(v.size <= 0.86f + 1e-3f && v.size > 0.8f);
 	/* a quick move to the side (1 s): followed within 1.5 s more, well
 	 * before the 5 s recentring could do it */
 	for (int i = 0; i < 30; i++) {
@@ -130,7 +137,7 @@ static void test_framing(void)
 		v = apple_framing_step(&f, &s, 1.0f / 30);
 	assert(f.still_for < 5.0f);
 	assert(fabsf(v.cx - (1 - v.size / 2)) < 0.02f);
-	s.head_h = 0.34f;
+	s.head_h = 0.22f;
 	s.head_top = 0.3f;
 	s.head_x = 0.7f;
 	/* user zoom: fixed size, still follows */

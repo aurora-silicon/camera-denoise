@@ -40,6 +40,7 @@
 #include "../zoom.h"
 #include "ane_prog.h"
 #include "framing.h"
+#include "gpu_fx.h"
 #include "portrait.h"
 
 #ifndef CDN_APPLE_DIR
@@ -67,13 +68,15 @@ struct fx {
 	struct apple_masks *masks;
 	float *rgb, *person, *skin;
 	struct apple_portrait *portrait;
+	/* the full-size passes on the GPU (quarter-size sums, composite), or NULL: the CPU loops */
+	struct apple_gpu *gpu;
 	struct apple_framing framing;
 	struct cdn_zoom *zoom;
 	uint64_t last_pts, last_seg;
 	int seg_errors;
 	bool bgr, show_mask, stats;
 	/* stats: summed milliseconds per stage since the last report */
-	double t_seg, t_refine, t_blur, t_light, t_frame;
+	double t_seg, t_refine, t_blur, t_light, t_comp, t_frame;
 	unsigned n_frames, n_seg;
 	uint64_t last_stats, last_dump;
 	struct apple_viewport last_view;
@@ -152,6 +155,7 @@ static void fx_destroy(void *opaque)
 		return;
 	apple_prog_close(&s->seg);
 	apple_portrait_free(s->portrait);
+	apple_gpu_free(s->gpu);
 	cdn_zoom_free(s->zoom);
 	free(s->masks);
 	free(s->rgb);
@@ -201,6 +205,17 @@ static void *fx_create(const struct ce_config *cfg)
 	s->portrait = apple_portrait_new((int)cfg->width, (int)cfg->height);
 	if (!s->masks || !s->rgb || !s->person || !s->skin || !s->portrait)
 		goto fail;
+	/* GPU by default (CDN_APPLE_GPU=0: the CPU loops); without one the CPU does it */
+	{
+		const char *e = getenv("CDN_APPLE_GPU");
+
+		if (!e || strcmp(e, "0"))
+			s->gpu = apple_gpu_new((int)cfg->width, (int)cfg->height,
+					       ((int)cfg->width + 3) / 4, ((int)cfg->height + 3) / 4);
+		fprintf(stderr, "camera-effects: apple: full-size passes (quarter sums, composite) on the %s%s%s\n",
+			s->gpu ? "GPU (" : "CPU", s->gpu ? apple_gpu_name(s->gpu) : "",
+			s->gpu ? ")" : (e && !strcmp(e, "0") ? " (CDN_APPLE_GPU=0)" : " (no usable GPU)"));
+	}
 	apple_framing_init(&s->framing, NULL, cfg->zoom);
 	if (cfg->framing || cfg->zoom > 1.0f)
 		s->zoom = cdn_zoom_new((int)cfg->width, (int)cfg->height, CDN_ZOOM_AUTO);
@@ -259,12 +274,12 @@ static void report(struct fx *s, const struct apple_subject *sub, uint64_t pts)
 	unsigned n = s->n_frames ? s->n_frames : 1;
 
 	fprintf(stderr, "camera-effects: apple: %u frames, %u segmentations; ms/frame: segment %.2f, "
-		"refine %.2f, blur %.2f, light %.2f, all %.2f; subject %s x %.2f-%.2f head %.2f,%.2f h %.2f "
+		"refine %.2f, blur %.2f, light %.2f, composite %.2f (%s), all %.2f; subject %s x %.2f-%.2f head %.2f,%.2f h %.2f "
 		"people %d; viewport %.2f,%.2f size %.2f\n",
 		s->n_frames, s->n_seg, s->t_seg / n, s->t_refine / n, s->t_blur / n, s->t_light / n,
-		s->t_frame / n, sub->present ? "yes" : "no", sub->x0, sub->x1, sub->head_x, sub->head_top,
+		s->t_comp / n, s->gpu ? "gpu" : "cpu", s->t_frame / n, sub->present ? "yes" : "no", sub->x0, sub->x1, sub->head_x, sub->head_top,
 		sub->head_h, sub->people, s->last_view.cx, s->last_view.cy, s->last_view.size);
-	s->t_seg = s->t_refine = s->t_blur = s->t_light = s->t_frame = 0;
+	s->t_seg = s->t_refine = s->t_blur = s->t_light = s->t_comp = s->t_frame = 0;
 	s->n_frames = s->n_seg = 0;
 	s->last_stats = pts;
 }
@@ -305,8 +320,29 @@ static int fx_process(void *opaque, const uint8_t *in, uint8_t *out, uint64_t pt
 	struct apple_subject subject;
 
 	apple_masks_subject(s->masks, &subject, (float)w / (float)h);
-	if (blur || light || s->show_mask)
-		apple_portrait_refine(s->portrait, s->masks, &f);
+	/*
+	 * The quarter-size sums refine and blur start from: the frame's one
+	 * upload to the GPU, which keeps it for the composite below.
+	 */
+	struct apple_quarter q;
+	bool loaded = false;
+
+	if (blur || light || s->show_mask) {
+		if (s->gpu) {
+			int rc = apple_gpu_quarter(s->gpu, &f, &q);
+
+			if (rc) {
+				fprintf(stderr, "camera-effects: apple: GPU quarter pass failed (%d): CPU from now on\n", rc);
+				apple_gpu_free(s->gpu);
+				s->gpu = NULL;
+			} else {
+				loaded = true;
+			}
+		}
+		if (!loaded)
+			apple_portrait_quarter(s->portrait, &f, &q);
+		apple_portrait_refine_q(s->portrait, s->masks, &q);
+	}
 	if (s->stats) {
 		double t = now_ms();
 
@@ -323,8 +359,11 @@ static int fx_process(void *opaque, const uint8_t *in, uint8_t *out, uint64_t pt
 		memset(out + (size_t)w * h, 128, (size_t)w * h / 2);
 		return 0;
 	}
+	/* the quarter-size maps of both effects from the frame as it came in, then one composite */
+	bool lit = false;
+
 	if (blur)
-		apple_portrait_blur(s->portrait, &f, BLUR_STRENGTH);
+		apple_portrait_blur_prepare_q(s->portrait, &q, BLUR_STRENGTH);
 	if (s->stats) {
 		double t = now_ms();
 
@@ -332,11 +371,39 @@ static int fx_process(void *opaque, const uint8_t *in, uint8_t *out, uint64_t pt
 		t1 = t;
 	}
 	if (light)
-		apple_portrait_light(s->portrait, &f, &subject, s->cfg.studio_light);
+		lit = apple_portrait_light_prepare(s->portrait, &subject, s->cfg.studio_light);
 	if (s->stats) {
 		double t = now_ms();
 
 		s->t_light += t - t1;
+		t1 = t;
+	}
+	if (blur || lit) {
+		int rc = -1;
+
+		if (s->gpu) {
+			struct apple_fx_maps m;
+
+			apple_portrait_maps(s->portrait, &m);
+			rc = apple_gpu_apply(s->gpu, &f, &m, blur, lit, loaded);
+			if (rc) {
+				/* f is untouched on a failure before the copy back; the CPU redoes it */
+				fprintf(stderr, "camera-effects: apple: GPU composite failed (%d): CPU from now on\n", rc);
+				apple_gpu_free(s->gpu);
+				s->gpu = NULL;
+			}
+		}
+		if (rc) {
+			if (blur)
+				apple_portrait_blur_apply(s->portrait, &f);
+			if (lit)
+				apple_portrait_light_apply(s->portrait, &f);
+		}
+	}
+	if (s->stats) {
+		double t = now_ms();
+
+		s->t_comp += t - t1;
 		t1 = t;
 	}
 	if (frame) {
