@@ -14,6 +14,9 @@ struct ce_config {
     uint32_t matrix;     /* 601 or 709 */
     uint32_t full_range;
     char replacement[1024];
+    /* Appended in ABI 1 (a plugin that predates it never reads it):
+     * Studio Light strength 0..1, 0 off. */
+    float studio_light;
 };
 struct ce_ops {
     uint32_t abi;

@@ -11,6 +11,9 @@ m = cc.find_library('m', required : false)
 
 pkgdatadir = get_option('prefix') / get_option('datadir') / 'aurora-camera-denoise'
 backenddir = get_option('prefix') / get_option('libdir') / 'aurora-camera-denoise'
+# Apple's networks, copied from the user's own macOS by install-apple-effects
+# (never shipped): <localstatedir>/lib/aurora-camera-denoise/apple
+appledir = get_option('prefix') / get_option('localstatedir') / 'lib' / 'aurora-camera-denoise' / 'apple'
 sysconfdir = get_option('prefix') / get_option('sysconfdir')
 if get_option('prefix') == '/usr'
   sysconfdir = '/etc'
@@ -20,6 +23,7 @@ add_project_arguments(
   '-DCDN_DATADIR="@0@"'.format(pkgdatadir),
   '-DCDN_SYSCONFDIR="@0@"'.format(sysconfdir),
   '-DCDN_BACKEND_DIR="@0@"'.format(backenddir),
+  '-DCDN_APPLE_DIR="@0@"'.format(appledir),
   '-D_GNU_SOURCE',
   language : 'c')
 
@@ -94,6 +98,19 @@ if host_machine.system() == 'linux' and cc.compiles('_Float16 h = 1.0f; int main
   test('ane', executable('test_ane', 'tests/test_ane.c', dependencies : core_dep),
     args : [ane.full_path(), meson.current_build_dir()])
   install_subdir('data/ane', install_dir : pkgdatadir, exclude_files : ['weights.bin'])
+
+  # Portrait, Studio Light and Center Stage with Apple's person segmentation
+  # on the Neural Engine (src/apple), loaded instead of the companion plugin
+  # when the networks are installed.
+  apple_src = files('src/apple/ane_prog.c', 'src/apple/framing.c', 'src/apple/portrait.c')
+  apple_fx = shared_module('aurora-camera-effects-apple', 'src/apple/apple_effects.c', apple_src, 'src/zoom.c',
+    gnu_symbol_visibility : 'hidden', dependencies : m,
+    install : true, install_dir : backenddir)
+  test('apple', executable('test_apple', 'tests/test_apple.c', apple_src, dependencies : m))
+  test('apple-plugin', executable('test_apple_plugin', 'tests/test_apple_plugin.c', dependencies : dl),
+    args : [apple_fx.full_path(), meson.current_build_dir()])
+  install_data('tools/install-apple-effects', install_dir : get_option('bindir'),
+    install_mode : 'rwxr-xr-x')
 endif
 
 executable('aurora-camera-denoise-bench', 'tools/cdn-bench.c',

@@ -38,6 +38,10 @@ pw-cli enum-params "$b" Props > "$work/B-still-off.txt"
 # Board has no framing block on this host; reject the whole mixed transaction.
 pw-cli set-param "$a" Props '{ params = [ "camera.background" "replace" "camera.background.path" "/unused.png" "camera.framing" true ] }'
 pw-cli enum-params "$a" Props > "$work/A-rejected.txt"
+# Studio Light: 0..1 accepted, out of range rejected (the previous value stays).
+pw-cli set-param "$a" Props '{ params = [ "camera.studio-light" 0.6 ] }'
+pw-cli set-param "$a" Props '{ params = [ "camera.studio-light" 1.5 ] }'
+pw-cli enum-params "$a" Props > "$work/A-light.txt"
 python3 - "$work" <<'PY'
 from pathlib import Path
 import sys
@@ -48,7 +52,10 @@ assert 'String "blur"' in (p/'A-blur.txt').read_text()
 assert 'String "off"' in (p/'B-still-off.txt').read_text()
 assert 'String "blur"' in (p/'A-rejected.txt').read_text()
 assert 'String "replace"' not in (p/'A-rejected.txt').read_text()
-print('PASS: effects off, per-stream isolation, control round-trip, unsupported board rejection')
+light=(p/'A-light.txt').read_text()
+i=light.index('"camera.studio-light"')
+assert 'Float 0.6' in light[i:i+80], light[i:i+80]
+print('PASS: effects off, per-stream isolation, control round-trip, unsupported board rejection, studio light')
 PY
 
 timeout 12 "$fixture" --sink > "$work/sink.log" 2>&1 & sink=$!;pids+=("$sink")

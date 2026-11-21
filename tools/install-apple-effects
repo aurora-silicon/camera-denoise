@@ -1,0 +1,59 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Install Apple's camera-effects networks for the Apple effects plugin.
+#
+#   sudo install-apple-effects DIR      install from DIR (one directory per network)
+#   sudo install-apple-effects --remove remove them (the companion plugin, if any, is used again)
+#   install-apple-effects --status
+#
+# DIR/personsemantics holds the HWX that macOS compiled for this Mac's Neural
+# Engine (from the aned cache of the user's own macOS) and the four sections
+# the Linux accel/ane driver loads with it: model.hwx, generic.bin,
+# operation.bin, procedure.bin, text-properties.bin. Nothing is downloaded and
+# nothing from Apple ships with this package.
+set -eu
+DEST=${CDN_APPLE_EFFECTS_DIR:-/var/lib/aurora-camera-denoise/apple}
+NETS="personsemantics"
+FILES="model.hwx generic.bin operation.bin procedure.bin text-properties.bin"
+
+status() {
+	for n in $NETS; do
+		if [ -r "$DEST/$n/model.hwx" ]; then
+			echo "$n: installed ($(sha256sum "$DEST/$n/model.hwx" | cut -c1-16))"
+		else
+			echo "$n: not installed"
+		fi
+	done
+	ls /dev/accel/accel* >/dev/null 2>&1 || echo "note: no /dev/accel node (accel/ane driver not loaded)"
+}
+
+case "${1:-}" in
+--status | "")
+	status
+	exit 0
+	;;
+--remove)
+	for n in $NETS; do rm -rf "${DEST:?}/$n"; done
+	status
+	exit 0
+	;;
+esac
+SRC=$1
+[ "$(id -u)" = 0 ] || [ -n "${CDN_APPLE_EFFECTS_DIR:-}" ] || { echo "needs root: sudo $0 $SRC" >&2; exit 1; }
+for n in $NETS; do
+	for f in $FILES; do
+		[ -s "$SRC/$n/$f" ] || { echo "$SRC/$n/$f missing" >&2; exit 1; }
+	done
+	# an HWX: magic 0xbeefface, little endian
+	magic=$(od -An -tx4 -N4 "$SRC/$n/model.hwx" | tr -d ' ')
+	[ "$magic" = beefface ] || { echo "$SRC/$n/model.hwx is not an HWX" >&2; exit 1; }
+done
+umask 022
+for n in $NETS; do
+	tmp="$DEST/.$n.new"
+	rm -rf "$tmp" && mkdir -p "$tmp"
+	for f in $FILES; do install -m 0644 "$SRC/$n/$f" "$tmp/$f"; done
+	rm -rf "${DEST:?}/$n" && mv "$tmp" "$DEST/$n"
+done
+status
+echo "restart the filter to use them: systemctl --user restart aurora-camera-denoise"

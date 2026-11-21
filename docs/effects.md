@@ -59,9 +59,43 @@ the same validation as board data. Reload an instance with SIGHUP after editing
 the config; capabilities update while each stream's effects remain opt-in.
 On a narrower sensor, configure the range to match the available field of view.
 Node properties `camera.framing.supported` and `camera.zoom.min`,
-`camera.zoom.max`, `camera.zoom.default` expose this capability to UIs. No
-framing calibration was taken from private files. Denoise controls and board
+`camera.zoom.max`, `camera.zoom.default` expose this capability to UIs. The
+board data takes no framing calibration from private files (the Apple
+plugin's controller uses CinematicFraming's tunables, see below). Denoise controls and board
 thresholds continue to use their established config.
+
+## Apple's networks (Portrait, Studio Light, Center Stage)
+
+On an Apple Silicon Mac whose Neural Engine the Linux `accel/ane` driver runs
+(ABI 3; M5 = H17G), the effects can use the person segmentation network macOS
+itself runs for Portrait, Studio Light and Center Stage (`personsemantics`,
+Portrait.framework's person segmentation: person and skin masks). The network
+is the HWX that macOS compiled for that Mac's Neural Engine, taken from the
+aned cache of the user's own macOS; it is never shipped with this package.
+`install-apple-effects DIR` installs it (with the four driver sections built
+from it) under `/var/lib/aurora-camera-denoise/apple`. While it is installed
+the filter loads `libaurora-camera-effects-apple.so` instead of the companion
+plugin (except for background replacement, which the Apple plugin does not do).
+
+- `camera.background` `blur`: Portrait-style blur. The masks are refined to the
+  frame with a guided filter and the background is blurred by normalized
+  convolution, so the person does not bleed into it.
+- `camera.studio-light` 0.0–1.0: Studio Light. The face is lifted by a fill
+  curve that spares highlights and the background is dimmed and desaturated.
+- `camera.framing` / `camera.zoom`: Center Stage. The viewport follows the
+  people with the tunables macOS ships for the MacBook Air M5 in
+  CinematicFraming.framework (default and minimum field of view, deadbands,
+  head offset, speeds, accelerations, recentring and no-subject timings).
+
+```sh
+pw-cli set-param NODE_ID Props '{ params = [ "camera.studio-light" 0.7 ] }'
+```
+
+Bring-up switches (in the service environment, e.g.
+`systemctl --user set-environment CDN_APPLE_DEBUG=mask` then restart):
+`CDN_APPLE_DEBUG=mask` shows the refined person mask as the picture;
+`CDN_APPLE_SEG_BGR=1` feeds the network B, G, R; `CDN_APPLE_EFFECTS_DIR`
+moves the network directory.
 
 ## Optional backend and frame ownership
 
@@ -76,7 +110,9 @@ NV12 buffers. The PipeWire callback copies/submits and takes completed frames;
 it neither allocates model state nor waits for inference. A pending output
 buffer is returned to PipeWire's free pool. A slow worker drops overloaded
 inputs, discards output older than 200 ms and retains original frame timestamps.
-It never combines an old mask with a new image. Ordinary dropped frames preserve time-based tracking; timestamp reversals or gaps
+The companion plugin never combines an old mask with a new image. The Apple
+plugin runs its network at most 15 times a second, as macOS does, and applies
+the newest (time-smoothed) masks to the frames in between. Ordinary dropped frames preserve time-based tracking; timestamp reversals or gaps
 over one second reset it.
 
 Effects run after the existing denoiser and are independent of its gain trigger.
