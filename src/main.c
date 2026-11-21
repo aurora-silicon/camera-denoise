@@ -86,6 +86,14 @@ struct cam {
 	 */
 	struct spa_source *retry;
 	int retry_ms;
+	/*
+	 * The exposure priority the camera had before the filter changed it.
+	 * V4L2 controls outlive the open file, so it goes back once the camera
+	 * has stopped (the source node is idle or suspended); otherwise the
+	 * next program that opens the camera directly gets the filter's choice.
+	 */
+	bool prio_saved;
+	int prio_prev;
 
 	struct spa_video_info_raw fmt; /* negotiated on out */
 	bool have_fmt;
@@ -644,8 +652,15 @@ static int cam_start_input(struct cam *c)
 	 * that is already streaming for another client keeps its setting.
 	 */
 	if (c->v4l2_path[0]) {
+		int prev = 0;
 		int err = cdn_v4l2_set_exposure_priority(c->v4l2_path,
-							 c->app->cfg.low_light_frame_rate);
+							 c->app->cfg.low_light_frame_rate,
+							 c->prio_saved ? NULL : &prev);
+		/* A restart before the camera stopped keeps the first saved value. */
+		if (!err && !c->prio_saved && prev != (int)c->app->cfg.low_light_frame_rate) {
+			c->prio_saved = true;
+			c->prio_prev = prev;
+		}
 		if (err && err != -ENOTTY)
 			fprintf(stderr, "camera-denoise: %s: low-light frame rate not set: %s\n",
 				c->src_nick, strerror(-err));
@@ -910,6 +925,17 @@ static void src_info(void *data, const struct pw_node_info *info)
 	const struct spa_dict *props = info->props;
 	const char *drv, *name, *p;
 
+	if (c->prio_saved && !c->in && (info->change_mask & PW_NODE_CHANGE_MASK_STATE) &&
+	    (info->state == PW_NODE_STATE_IDLE || info->state == PW_NODE_STATE_SUSPENDED)) {
+		int err = cdn_v4l2_set_exposure_priority(c->v4l2_path, c->prio_prev, NULL);
+
+		/* Busy: another client streams it; the next idle tries again. */
+		if (err != -EBUSY)
+			c->prio_saved = false;
+		if (err && err != -EBUSY)
+			fprintf(stderr, "camera-denoise: %s: low-light frame rate not restored: %s\n",
+				c->src_nick, strerror(-err));
+	}
 	if (c->checked || !props)
 		return;
 	c->checked = true;
