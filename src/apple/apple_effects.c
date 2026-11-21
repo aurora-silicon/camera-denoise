@@ -56,8 +56,9 @@
 #define SEG_SMOOTH 0.5f
 #define STATS_PERIOD_NS 5000000000ull
 #define DUMP_MAX 8
-/* blur strength for camera.background = blur */
-#define BLUR_STRENGTH 0.85f
+/* blur strength for camera.background = blur: a sigma of about 10 pixels at
+ * 1280 wide (0.85 was ~22, about twice as blurry as macOS by eye, 2026-11-21) */
+#define BLUR_STRENGTH 0.3f
 
 struct fx {
 	struct ce_config cfg;

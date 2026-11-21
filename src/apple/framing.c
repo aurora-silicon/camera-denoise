@@ -24,7 +24,7 @@
 void apple_framing_params_default(struct apple_framing_params *p)
 {
 	*p = (struct apple_framing_params) {
-		.default_fov = 0.68f, .min_fov = 0.34f,
+		.default_fov = 0.68f, .min_fov = 0.5f,
 		.deadband_w = 0.6f, .deadband_h = 0.3f,
 		.group_deadband_w = 0.8f, .group_deadband_h = 0.5f,
 		.top_offset = 0.15f, .group_width = 0.8f,
@@ -41,8 +41,12 @@ void apple_framing_params_default(struct apple_framing_params *p)
 /* Base rates the multipliers scale: viewport fractions per second (squared). */
 #define SPEED_BASE 0.25f
 #define ACCEL_BASE 1.0f
-/* Smoothing of the per-frame subject box (seconds). */
-#define SUBJECT_TAU 0.15f
+/* Smoothing of the per-frame subject box (seconds); the head size, which
+ * sets the zoom, more (a size jitter shows as pumping). */
+#define SUBJECT_TAU 0.25f
+#define SIZE_TAU 0.8f
+/* the target size changes only when the wanted one differs by more than this */
+#define SIZE_HYSTERESIS 0.15f
 
 static float clampf(float v, float lo, float hi)
 {
@@ -113,22 +117,35 @@ static struct apple_viewport wanted(const struct apple_framing *f, const struct 
 	return v;
 }
 
-/* One axis: velocity toward k * error, capped at vmax, changed at most amax per s. */
-static void axis(float *p, float *v, float target, float k, float vmax_up, float vmax_down,
-		 float amax, float dt)
+/*
+ * One axis: a critically damped spring towards the target (ease in, ease
+ * out, no overshoot), its speed capped at vmax. smooth is the time it takes
+ * to cover most of a step; the acceleration it asks for stays within amax.
+ * The old controller stopped dead when it reached the target, which showed
+ * as a jerk at the end of every move (2026-11-21).
+ */
+static void axis(float *p, float *v, float target, float smooth, float vmax, float amax, float dt)
 {
-	float err = target - *p;
-	float want = clampf(k * err, -vmax_down, vmax_up);
-	float dv = clampf(want - *v, -amax * dt, amax * dt);
+	float omega = 2.0f / fmaxf(smooth, 1e-3f);
+	float x = omega * dt;
+	float decay = 1.0f / (1.0f + x + 0.48f * x * x + 0.235f * x * x * x);
+	float change = clampf(*p - target, -vmax * smooth, vmax * smooth);
+	float goal = *p - change;
+	float temp = (*v + omega * change) * dt;
+	float nv = (*v - omega * temp) * decay;
+	float np = goal + (change + temp) * decay;
 
-	*v += dv;
-	/* do not overshoot the target within this step */
-	if ((err > 0 && *v * dt > err) || (err < 0 && *v * dt < err)) {
-		*p = target;
-		*v = 0;
-		return;
+	/* keep the acceleration within amax (a sudden new target eases in) */
+	nv = clampf(nv, *v - amax * dt, *v + amax * dt);
+	nv = clampf(nv, -vmax, vmax);
+	np = *p + nv * dt;
+	/* no overshoot */
+	if ((target - *p > 0) == (np > target)) {
+		np = target;
+		nv = 0;
 	}
-	*p += *v * dt;
+	*p = np;
+	*v = nv;
 }
 
 struct apple_viewport apple_framing_step(struct apple_framing *f,
@@ -136,6 +153,7 @@ struct apple_viewport apple_framing_step(struct apple_framing *f,
 {
 	const struct apple_framing_params *p = &f->p;
 	struct apple_subject s = in ? *in : (struct apple_subject) { 0 };
+	/* ease_* are approach rates (1/s): a spring of smoothing time 1/rate */
 	float gain_x = p->ease_x, gain_y = p->ease_y, gain_z = p->ease_zoom;
 
 	if (!(dt > 0) || dt > 1.0f)
@@ -159,7 +177,7 @@ struct apple_viewport apple_framing_step(struct apple_framing *f,
 			f->smooth.y1 += a * (s.y1 - f->smooth.y1);
 			f->smooth.head_x += a * (s.head_x - f->smooth.head_x);
 			f->smooth.head_top += a * (s.head_top - f->smooth.head_top);
-			f->smooth.head_h += a * (s.head_h - f->smooth.head_h);
+			f->smooth.head_h += (1.0f - expf(-dt / SIZE_TAU)) * (s.head_h - f->smooth.head_h);
 			f->smooth.people = s.people;
 			f->smooth.present = true;
 		}
@@ -186,7 +204,7 @@ struct apple_viewport apple_framing_step(struct apple_framing *f,
 			f->target.cx = w.cx;
 		if (!f->started || fabsf(raw.cy - f->target.cy) > half_h || recenter)
 			f->target.cy = w.cy;
-		if (!f->started || fabsf(w.size - f->target.size) > 0.1f * f->target.size ||
+		if (!f->started || fabsf(w.size - f->target.size) > SIZE_HYSTERESIS * f->target.size ||
 		    recenter || f->zoom > 0)
 			f->target.size = w.size;
 		if (recenter) {
@@ -210,13 +228,14 @@ struct apple_viewport apple_framing_step(struct apple_framing *f,
 	}
 	clamp_viewport(&f->target);
 
-	axis(&f->pos.cx, &f->vel.cx, f->target.cx, gain_x, SPEED_BASE * p->speed_x,
-	     SPEED_BASE * p->speed_x, ACCEL_BASE * p->accel_x, dt);
-	axis(&f->pos.cy, &f->vel.cy, f->target.cy, gain_y, SPEED_BASE * p->speed_y,
-	     SPEED_BASE * p->speed_y, ACCEL_BASE * p->accel_y, dt);
+	axis(&f->pos.cx, &f->vel.cx, f->target.cx, 1.0f / gain_x, SPEED_BASE * p->speed_x,
+	     ACCEL_BASE * p->accel_x, dt);
+	axis(&f->pos.cy, &f->vel.cy, f->target.cy, 1.0f / gain_y, SPEED_BASE * p->speed_y,
+	     ACCEL_BASE * p->accel_y, dt);
 	/* size up = zoom out (faster), size down = zoom in */
-	axis(&f->pos.size, &f->vel.size, f->target.size, gain_z, SPEED_BASE * p->speed_zoom_out,
-	     SPEED_BASE * p->speed_zoom_in, ACCEL_BASE * p->accel_zoom, dt);
+	axis(&f->pos.size, &f->vel.size, f->target.size, 1.0f / gain_z,
+	     SPEED_BASE * (f->target.size > f->pos.size ? p->speed_zoom_out : p->speed_zoom_in),
+	     ACCEL_BASE * p->accel_zoom, dt);
 	clamp_viewport(&f->pos);
 	return f->pos;
 }

@@ -292,7 +292,12 @@ const float *apple_portrait_alpha(const struct apple_portrait *p, int *w, int *h
 	return p->alpha;
 }
 
-/* Box mean of radius r (window 2r+1, clipped at the edges), separable, src -> dst. */
+/* Box mean of radius r (window 2r+1, clipped at the edges), separable, src -> dst.
+ * The vertical pass runs over whole rows (a running column sum), not down
+ * the columns: contiguous, so it vectorizes and stays in the cache. */
+static __thread float *box_acc;
+static __thread int box_acc_n;
+
 static void box(const float *src, float *dst, float *tmp, int w, int h, int r)
 {
 	for (int y = 0; y < h; y++) {
@@ -310,19 +315,38 @@ static void box(const float *src, float *dst, float *tmp, int w, int h, int r)
 			d[x] = sum / (b - a + 1);
 		}
 	}
-	for (int x = 0; x < w; x++) {
-		float sum = 0;
-		int lo = 0, hi = -1;
+	if (box_acc_n < w) {
+		float *n = realloc(box_acc, sizeof(float) * (size_t)w);
 
-		for (int y = 0; y < h; y++) {
-			int a = y - r < 0 ? 0 : y - r, b = y + r >= h ? h - 1 : y + r;
+		if (!n)
+			return;
+		box_acc = n;
+		box_acc_n = w;
+	}
+	float *acc = box_acc;
+	int lo = 0, hi = -1;
 
-			while (hi < b)
-				sum += tmp[(size_t)++hi * w + x];
-			while (lo < a)
-				sum -= tmp[(size_t)lo++ * w + x];
-			dst[(size_t)y * w + x] = sum / (b - a + 1);
+	memset(acc, 0, sizeof(float) * (size_t)w);
+	for (int y = 0; y < h; y++) {
+		int a = y - r < 0 ? 0 : y - r, b = y + r >= h ? h - 1 : y + r;
+
+		while (hi < b) {
+			const float *row = tmp + (size_t)++hi * w;
+
+			for (int x = 0; x < w; x++)
+				acc[x] += row[x];
 		}
+		while (lo < a) {
+			const float *row = tmp + (size_t)lo++ * w;
+
+			for (int x = 0; x < w; x++)
+				acc[x] -= row[x];
+		}
+		float inv = 1.0f / (b - a + 1);
+		float *d = dst + (size_t)y * w;
+
+		for (int x = 0; x < w; x++)
+			d[x] = acc[x] * inv;
 	}
 }
 
@@ -443,10 +467,16 @@ void apple_portrait_blur(struct apple_portrait *p, struct cdn_frame *f, float st
 	int w = p->qw, h = p->qh;
 	size_t n = (size_t)w * h;
 	float *wt = p->t0, *tmp = p->t4, *num = p->t1, *den = p->t2;
-	/* radius at quarter size, for 1920 wide: 12 is 48 frame pixels, a strong lens
-	 * blur; other sizes scale with the width */
-	int r = (int)lroundf((3 + 9 * clampf(strength, 0, 1)) * w / 480.0f);
-	int pass_r = r / 2 > 1 ? r / 2 : 1;
+	/*
+	 * The blur's size as a Gaussian sigma in frame pixels at 1280 wide:
+	 * 4 + 20 x strength (other widths scale). Three box passes of radius q
+	 * at quarter size give sigma^2 = q (q + 1) quarter pixels.
+	 */
+	float sigma_q = (4 + 20 * clampf(strength, 0, 1)) * f->width / 1280.0f / 4;
+	int pass_r = (int)lroundf(sqrtf(sigma_q * sigma_q + 0.25f) - 0.5f);
+
+	if (pass_r < 1)
+		pass_r = 1;
 
 	/* quarter-size planes of the frame: area averages (4 x 4 luma, 2 x 2 chroma) */
 	for (int y = 0; y < h; y++)
