@@ -87,8 +87,8 @@ static void test_framing(void)
 	}
 	assert(fabsf(v.cx - fminf(0.7f, 1 - v.size / 2)) < 0.01f);
 	assert(max_step <= 0.25f * 2.0f / 30 + 1e-4f);
-	/* head 0.34 high: viewport 2 x head, clamped to [0.34, 0.8] for one person */
-	assert(fabsf(v.size - 0.68f) < 0.02f);
+	/* head 0.34 high: viewport 1.8 x head, clamped to [0.34, 0.72] for one person */
+	assert(fabsf(v.size - 0.612f) < 0.02f);
 	/* the head top sits about 0.15 of the viewport below its top */
 	assert(fabsf((s.head_top - (v.cy - v.size / 2)) / v.size - 0.15f) < 0.05f);
 	/* small moves inside the deadband do not move the viewport */
@@ -119,13 +119,16 @@ static void test_framing(void)
 	s.head_top = 0.15f;
 	for (int i = 0; i < 90; i++)
 		v = apple_framing_step(&f, &s, 1.0f / 30);
-	assert(v.size <= 0.8f + 1e-3f && v.size > 0.6f);
-	for (int i = 0; i < 150; i++) {
-		s.head_x = 0.5f + 0.35f * i / 150;
+	assert(v.size <= 0.72f + 1e-3f && v.size > 0.6f);
+	/* a quick move to the side (1 s): followed within 1.5 s more, well
+	 * before the 5 s recentring could do it */
+	for (int i = 0; i < 30; i++) {
+		s.head_x = 0.5f + 0.35f * (i + 1) / 30;
 		v = apple_framing_step(&f, &s, 1.0f / 30);
 	}
-	for (int i = 0; i < 60; i++)
+	for (int i = 0; i < 45; i++)
 		v = apple_framing_step(&f, &s, 1.0f / 30);
+	assert(f.still_for < 5.0f);
 	assert(fabsf(v.cx - (1 - v.size / 2)) < 0.02f);
 	s.head_h = 0.34f;
 	s.head_top = 0.3f;

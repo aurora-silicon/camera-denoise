@@ -16,9 +16,9 @@
  *
  * Ours, not Apple's: face_fov and max_fov. The plist's viewport is a share of
  * the sensor's width; the Linux frame is a 16:9 crop of that width, so a head
- * at laptop distance is 0.3-0.45 of the frame high. face_fov 2 puts a 0.34
+ * at laptop distance is 0.3-0.45 of the frame high. face_fov 1.8 puts a 0.38
  * head at the default viewport; one person is never framed wider than
- * max_fov, so there is always room to follow them (2026-11-21: with 4.5 and
+ * max_fov, so there is always room to follow them (+-0.14 of the frame) (2026-11-21: with 4.5 and
  * no cap the viewport grew to the whole frame and Center Stage stopped).
  */
 void apple_framing_params_default(struct apple_framing_params *p)
@@ -34,7 +34,7 @@ void apple_framing_params_default(struct apple_framing_params *p)
 		.recenter_idle_s = 5.0f, .recenter_s = 1.5f,
 		.no_subject_wait_s = 5.0f, .no_subject_return_s = 5.0f,
 		.tiny_head = 0.015f, .movement_tolerance = 0.2f,
-		.face_fov = 2.0f, .max_fov = 0.8f,
+		.face_fov = 1.8f, .max_fov = 0.72f,
 	};
 }
 
@@ -88,7 +88,8 @@ void apple_framing_reset(struct apple_framing *f)
 }
 
 /* The viewport the subject asks for: head near the top, or the group framed. */
-static struct apple_viewport wanted(const struct apple_framing *f, const struct apple_subject *s)
+static struct apple_viewport wanted(const struct apple_framing *f, const struct apple_subject *s,
+				    struct apple_viewport *raw)
 {
 	struct apple_viewport v;
 	float size;
@@ -106,6 +107,8 @@ static struct apple_viewport wanted(const struct apple_framing *f, const struct 
 	v.size = size;
 	v.cx = s->people > 1 ? (s->x0 + s->x1) / 2 : s->head_x;
 	v.cy = s->head_top + size * (0.5f - f->p.top_offset);
+	/* where the subject is, before the frame's edges stop the viewport */
+	*raw = v;
 	clamp_viewport(&v);
 	return v;
 }
@@ -168,17 +171,20 @@ struct apple_viewport apple_framing_step(struct apple_framing *f,
 		else
 			f->still_for = 0;
 
-		struct apple_viewport w = wanted(f, &f->smooth);
+		struct apple_viewport raw, w = wanted(f, &f->smooth, &raw);
 		bool group = f->smooth.people > 1;
 		float half_w = (group ? p->group_deadband_w : p->deadband_w) * f->target.size / 2;
 		float half_h = (group ? p->group_deadband_h : p->deadband_h) * f->target.size / 2;
 		bool recenter = f->still_for >= p->recenter_idle_s;
 
 		/* First sight: frame the subject. Then move only when it leaves the
-		 * deadband, or recentre once it has been still for a while. */
-		if (!f->started || fabsf(w.cx - f->target.cx) > half_w || recenter)
+		 * deadband, or recentre once it has been still for a while. The
+		 * deadband is tested on where the subject is, not on the clamped
+		 * viewport: near an edge the clamped centre moves less than the
+		 * subject and never left the deadband (2026-11-21). */
+		if (!f->started || fabsf(raw.cx - f->target.cx) > half_w || recenter)
 			f->target.cx = w.cx;
-		if (!f->started || fabsf(w.cy - f->target.cy) > half_h || recenter)
+		if (!f->started || fabsf(raw.cy - f->target.cy) > half_h || recenter)
 			f->target.cy = w.cy;
 		if (!f->started || fabsf(w.size - f->target.size) > 0.1f * f->target.size ||
 		    recenter || f->zoom > 0)

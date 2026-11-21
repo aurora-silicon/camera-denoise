@@ -22,10 +22,12 @@
  *   CDN_APPLE_DEBUG=mask    show the refined person mask as the picture
  *   CDN_APPLE_DEBUG=stats   every 5 s: milliseconds per stage, the subject
  *                           and the Center Stage viewport (to stderr)
- *   CDN_APPLE_DUMP=<dir>    every 5 s, up to 24 times: the frame as it came
- *                           in (NV12) and the network's person and skin
- *                           masks (8-bit, 256 x 192) to <dir>, for tuning.
- *                           Pictures of the user: keep them local.
+ *   CDN_APPLE_DUMP=<dir>    every 5 s, up to 8 times per stream: the frame
+ *                           as it came in (NV12) and the network's person
+ *                           and skin masks (8-bit, 256 x 192) to <dir>,
+ *                           named by wall-clock time (each effect switch
+ *                           makes a new plugin instance). Pictures of the
+ *                           user: keep them local.
  */
 #include <errno.h>
 #include <math.h>
@@ -53,7 +55,7 @@
 /* weight of a new network run where the mask holds still (moving parts: 1) */
 #define SEG_SMOOTH 0.5f
 #define STATS_PERIOD_NS 5000000000ull
-#define DUMP_MAX 24
+#define DUMP_MAX 8
 /* blur strength for camera.background = blur */
 #define BLUR_STRENGTH 0.85f
 
@@ -93,7 +95,12 @@ static void dump(struct fx *s, const uint8_t *in, uint64_t pts)
 	int w = (int)s->cfg.width, h = (int)s->cfg.height;
 	static uint8_t m8[APPLE_SEG_W * APPLE_SEG_H];
 
-	snprintf(path, sizeof(path), "%s/frame-%02u-%dx%d.nv12", s->dump_dir, s->dumps, w, h);
+	struct timespec ts;
+	char stamp[32];
+
+	clock_gettime(CLOCK_REALTIME, &ts);
+	snprintf(stamp, sizeof(stamp), "%lld-%03ld", (long long)ts.tv_sec, ts.tv_nsec / 1000000);
+	snprintf(path, sizeof(path), "%s/frame-%s-%dx%d.nv12", s->dump_dir, stamp, w, h);
 	fp = fopen(path, "wb");
 	if (!fp) {
 		fprintf(stderr, "camera-effects: apple: dump %s: %s\n", path, strerror(errno));
@@ -108,7 +115,7 @@ static void dump(struct fx *s, const uint8_t *in, uint64_t pts)
 	for (int i = 0; i < 2; i++) {
 		for (int j = 0; j < APPLE_SEG_W * APPLE_SEG_H; j++)
 			m8[j] = (uint8_t)lroundf(fminf(fmaxf(planes[i][j], 0), 1) * 255);
-		snprintf(path, sizeof(path), "%s/frame-%02u-%s.pgm", s->dump_dir, s->dumps, names[i]);
+		snprintf(path, sizeof(path), "%s/frame-%s-%s.pgm", s->dump_dir, stamp, names[i]);
 		fp = fopen(path, "wb");
 		if (!fp)
 			continue;
