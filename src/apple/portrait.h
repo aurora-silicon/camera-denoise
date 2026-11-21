@@ -35,7 +35,8 @@ void apple_nv12_to_rgb(const struct cdn_frame *in, int matrix, int full_range,
 void apple_masks_update(struct apple_masks *m, const float *person, const float *skin, float a);
 
 /* The people and the head, from the masks. */
-void apple_masks_subject(const struct apple_masks *m, struct apple_subject *s);
+/* aspect: the frame's width / height (0 = unknown) */
+void apple_masks_subject(const struct apple_masks *m, struct apple_subject *s, float aspect);
 
 struct apple_portrait;
 struct apple_portrait *apple_portrait_new(int width, int height);

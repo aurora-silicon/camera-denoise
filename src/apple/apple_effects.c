@@ -12,20 +12,27 @@
  *   model.hwx, generic.bin, operation.bin, procedure.bin, text-properties.bin
  * <models> is $CDN_APPLE_EFFECTS_DIR, else CDN_APPLE_DIR.
  *
- * Per frame: segmentation (at most 15 times a second, as macOS's "lowfps"
- * variant), masks refined to the frame, then blur and light on the whole
- * frame, then Center Stage crops and scales (the SoC scaler when there is
- * one) with CinematicFraming's tunables.
+ * Per frame: segmentation (every frame up to 30 a second: at 15 the mask
+ * trailed a moving person), masks refined to the frame, then blur and light
+ * on the whole frame, then Center Stage crops and scales (the SoC scaler when
+ * there is one) with CinematicFraming's tunables.
  *
  * Bring-up switches (environment of the filter's service):
- *   CDN_APPLE_SEG_BGR=1   feed the network B, G, R instead of R, G, B
- *   CDN_APPLE_DEBUG=mask  show the refined person mask as the picture
+ *   CDN_APPLE_SEG_BGR=1     feed the network B, G, R instead of R, G, B
+ *   CDN_APPLE_DEBUG=mask    show the refined person mask as the picture
+ *   CDN_APPLE_DEBUG=stats   every 5 s: milliseconds per stage, the subject
+ *                           and the Center Stage viewport (to stderr)
+ *   CDN_APPLE_DUMP=<dir>    every 5 s, up to 24 times: the frame as it came
+ *                           in (NV12) and the network's person and skin
+ *                           masks (8-bit, 256 x 192) to <dir>, for tuning.
+ *                           Pictures of the user: keep them local.
  */
 #include <errno.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "../camera_effects.h"
 #include "../zoom.h"
@@ -41,10 +48,12 @@
 #define SEG_PERSON "293bdc1f04ed53222ad81ce2f31e4b37" /* person:0 */
 #define SEG_SKIN "abc6c1daccb4856d5e9a5e9a120e6055"   /* skin:0 */
 #define SEG_IMAGE "image__Placeholder__0"
-/* macOS runs the low-fps variant: no more often than this */
-#define SEG_PERIOD_NS (1000000000ull / 15)
-/* mask smoothing per network run (0..1, 1 = no smoothing) */
-#define SEG_SMOOTH 0.65f
+/* no more often than this: every frame at 30 fps (a little slack for jitter) */
+#define SEG_PERIOD_NS (1000000000ull / 40)
+/* weight of a new network run where the mask holds still (moving parts: 1) */
+#define SEG_SMOOTH 0.5f
+#define STATS_PERIOD_NS 5000000000ull
+#define DUMP_MAX 24
 /* blur strength for camera.background = blur */
 #define BLUR_STRENGTH 0.85f
 
@@ -59,8 +68,57 @@ struct fx {
 	struct cdn_zoom *zoom;
 	uint64_t last_pts, last_seg;
 	int seg_errors;
-	bool bgr, show_mask;
+	bool bgr, show_mask, stats;
+	/* stats: summed milliseconds per stage since the last report */
+	double t_seg, t_refine, t_blur, t_light, t_frame;
+	unsigned n_frames, n_seg;
+	uint64_t last_stats, last_dump;
+	struct apple_viewport last_view;
+	const char *dump_dir;
+	unsigned dumps;
 };
+
+static double now_ms(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return ts.tv_sec * 1e3 + ts.tv_nsec * 1e-6;
+}
+
+static void dump(struct fx *s, const uint8_t *in, uint64_t pts)
+{
+	char path[1200];
+	FILE *fp;
+	int w = (int)s->cfg.width, h = (int)s->cfg.height;
+	static uint8_t m8[APPLE_SEG_W * APPLE_SEG_H];
+
+	snprintf(path, sizeof(path), "%s/frame-%02u-%dx%d.nv12", s->dump_dir, s->dumps, w, h);
+	fp = fopen(path, "wb");
+	if (!fp) {
+		fprintf(stderr, "camera-effects: apple: dump %s: %s\n", path, strerror(errno));
+		s->dump_dir = NULL;
+		return;
+	}
+	fwrite(in, 1, (size_t)w * h * 3 / 2, fp);
+	fclose(fp);
+	const float *planes[2] = { s->person, s->skin };
+	const char *names[2] = { "person", "skin" };
+
+	for (int i = 0; i < 2; i++) {
+		for (int j = 0; j < APPLE_SEG_W * APPLE_SEG_H; j++)
+			m8[j] = (uint8_t)lroundf(fminf(fmaxf(planes[i][j], 0), 1) * 255);
+		snprintf(path, sizeof(path), "%s/frame-%02u-%s.pgm", s->dump_dir, s->dumps, names[i]);
+		fp = fopen(path, "wb");
+		if (!fp)
+			continue;
+		fprintf(fp, "P5\n%d %d\n255\n", APPLE_SEG_W, APPLE_SEG_H);
+		fwrite(m8, 1, sizeof(m8), fp);
+		fclose(fp);
+	}
+	s->dumps++;
+	s->last_dump = pts;
+}
 
 static const char *models_dir(void)
 {
@@ -111,7 +169,9 @@ static void *fx_create(const struct ce_config *cfg)
 	s->cfg = *cfg;
 	s->seg.fd = -1;
 	s->bgr = getenv("CDN_APPLE_SEG_BGR") && !strcmp(getenv("CDN_APPLE_SEG_BGR"), "1");
-	s->show_mask = getenv("CDN_APPLE_DEBUG") && !strcmp(getenv("CDN_APPLE_DEBUG"), "mask");
+	s->show_mask = getenv("CDN_APPLE_DEBUG") && strstr(getenv("CDN_APPLE_DEBUG"), "mask");
+	s->stats = getenv("CDN_APPLE_DEBUG") && strstr(getenv("CDN_APPLE_DEBUG"), "stats");
+	s->dump_dir = getenv("CDN_APPLE_DUMP") && *getenv("CDN_APPLE_DUMP") ? getenv("CDN_APPLE_DUMP") : NULL;
 	snprintf(dir, sizeof(dir), "%s/personsemantics", models_dir());
 	ret = apple_prog_open(&s->seg, dir);
 	if (ret) {
@@ -186,6 +246,21 @@ static int segment(struct fx *s, const struct cdn_frame *f)
 	return 0;
 }
 
+static void report(struct fx *s, const struct apple_subject *sub, uint64_t pts)
+{
+	unsigned n = s->n_frames ? s->n_frames : 1;
+
+	fprintf(stderr, "camera-effects: apple: %u frames, %u segmentations; ms/frame: segment %.2f, "
+		"refine %.2f, blur %.2f, light %.2f, all %.2f; subject %s x %.2f-%.2f head %.2f,%.2f h %.2f "
+		"people %d; viewport %.2f,%.2f size %.2f\n",
+		s->n_frames, s->n_seg, s->t_seg / n, s->t_refine / n, s->t_blur / n, s->t_light / n,
+		s->t_frame / n, sub->present ? "yes" : "no", sub->x0, sub->x1, sub->head_x, sub->head_top,
+		sub->head_h, sub->people, s->last_view.cx, s->last_view.cy, s->last_view.size);
+	s->t_seg = s->t_refine = s->t_blur = s->t_light = s->t_frame = 0;
+	s->n_frames = s->n_seg = 0;
+	s->last_stats = pts;
+}
+
 static int fx_process(void *opaque, const uint8_t *in, uint8_t *out, uint64_t pts)
 {
 	struct fx *s = opaque;
@@ -194,6 +269,7 @@ static int fx_process(void *opaque, const uint8_t *in, uint8_t *out, uint64_t pt
 	bool blur = s->cfg.background == 1, light = s->cfg.studio_light > 0;
 	bool frame = s->cfg.framing, need_masks = blur || light || frame;
 	float dt = s->last_pts && pts > s->last_pts ? (float)((pts - s->last_pts) * 1e-9) : 1.0f / 30;
+	double t0 = s->stats ? now_ms() : 0, t1 = t0;
 
 	memcpy(out, in, (size_t)w * h * 3 / 2);
 	s->last_pts = pts;
@@ -207,12 +283,28 @@ static int fx_process(void *opaque, const uint8_t *in, uint8_t *out, uint64_t pt
 			return ret;
 		}
 		s->last_seg = pts;
+		s->n_seg++;
+		if (s->dump_dir && s->dumps < DUMP_MAX &&
+		    (!s->dumps || pts < s->last_dump || pts - s->last_dump >= STATS_PERIOD_NS))
+			dump(s, in, pts);
+	}
+	if (s->stats) {
+		double t = now_ms();
+
+		s->t_seg += t - t1;
+		t1 = t;
 	}
 	struct apple_subject subject;
 
-	apple_masks_subject(s->masks, &subject);
+	apple_masks_subject(s->masks, &subject, (float)w / (float)h);
 	if (blur || light || s->show_mask)
 		apple_portrait_refine(s->portrait, s->masks, &f);
+	if (s->stats) {
+		double t = now_ms();
+
+		s->t_refine += t - t1;
+		t1 = t;
+	}
 	if (s->show_mask) {
 		int qw, qh;
 		const float *a = apple_portrait_alpha(s->portrait, &qw, &qh);
@@ -225,17 +317,36 @@ static int fx_process(void *opaque, const uint8_t *in, uint8_t *out, uint64_t pt
 	}
 	if (blur)
 		apple_portrait_blur(s->portrait, &f, BLUR_STRENGTH);
+	if (s->stats) {
+		double t = now_ms();
+
+		s->t_blur += t - t1;
+		t1 = t;
+	}
 	if (light)
 		apple_portrait_light(s->portrait, &f, &subject, s->cfg.studio_light);
+	if (s->stats) {
+		double t = now_ms();
+
+		s->t_light += t - t1;
+		t1 = t;
+	}
 	if (frame) {
 		struct apple_viewport v = apple_framing_step(&s->framing, &subject, dt);
 		struct cdn_rect r;
 
+		s->last_view = v;
 		apple_framing_crop(&v, w, h, &r.x, &r.y, &r.w, &r.h);
 		if (s->zoom && (r.w < w || r.h < h))
 			cdn_zoom_apply(s->zoom, &f, r);
 	} else if (s->cfg.zoom > 1.0f && s->zoom) {
 		cdn_zoom_apply(s->zoom, &f, cdn_zoom_rect(w, h, s->cfg.zoom));
+	}
+	if (s->stats) {
+		s->t_frame += now_ms() - t0;
+		s->n_frames++;
+		if (!s->last_stats || pts < s->last_stats || pts - s->last_stats >= STATS_PERIOD_NS)
+			report(s, &subject, pts);
 	}
 	return 0;
 }

@@ -31,6 +31,7 @@ struct apple_framing_params {
 	float tiny_head;         /* heads smaller than this (of frame height) are ignored */
 	float movement_tolerance; /* of the head size: smaller moves are "still" */
 	float face_fov;          /* viewport size per unit of head height */
+	float max_fov;           /* one person is never framed wider than this */
 };
 
 /* The J815/J813 values (also J616s's: the plist is shared). */

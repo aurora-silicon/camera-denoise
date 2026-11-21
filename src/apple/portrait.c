@@ -15,6 +15,13 @@ static int clampi(int v, int lo, int hi)
 	return v < lo ? lo : v > hi ? hi : v;
 }
 
+static float smoothstep(float e0, float e1, float v)
+{
+	float t = clampf((v - e0) / (e1 - e0), 0, 1);
+
+	return t * t * (3 - 2 * t);
+}
+
 /* --- network input ------------------------------------------------------- */
 
 void apple_nv12_to_rgb(const struct cdn_frame *in, int matrix, int full_range,
@@ -61,18 +68,30 @@ void apple_nv12_to_rgb(const struct cdn_frame *in, int matrix, int full_range,
 
 void apple_masks_update(struct apple_masks *m, const float *person, const float *skin, float a)
 {
+	/*
+	 * a is the weight of the new run where the mask holds still: that
+	 * hides the network's flicker. Where it changed by MOTION or more the
+	 * new run is taken as it is, so a moving person is not trailed by an
+	 * old mask (the lag of a plain running mean).
+	 */
+	const float motion = 0.25f;
+
 	if (!m->valid)
 		a = 1;
 	for (int i = 0; i < APPLE_SEG_W * APPLE_SEG_H; i++) {
-		m->person[i] += a * (clampf(person[i], 0, 1) - m->person[i]);
-		m->skin[i] += a * (clampf(skin[i], 0, 1) - m->skin[i]);
+		float np = clampf(person[i], 0, 1), ns = clampf(skin[i], 0, 1);
+		float d = fabsf(np - m->person[i]);
+		float w = a + (1 - a) * clampf(d / motion, 0, 1);
+
+		m->person[i] += w * (np - m->person[i]);
+		m->skin[i] += w * (ns - m->skin[i]);
 	}
 	m->valid = 1;
 }
 
 /* --- the subject for Center Stage and Studio Light ------------------------- */
 
-void apple_masks_subject(const struct apple_masks *m, struct apple_subject *s)
+void apple_masks_subject(const struct apple_masks *m, struct apple_subject *s, float aspect)
 {
 	enum { W = APPLE_SEG_W, H = APPLE_SEG_H };
 	int cols[W] = { 0 }, rows[H] = { 0 }, total = 0;
@@ -119,20 +138,44 @@ void apple_masks_subject(const struct apple_masks *m, struct apple_subject *s)
 	}
 	/* the head: skin in the top 45 % of the person (the face, not the hands) */
 	int band = y0 + (y1 - y0) * 45 / 100, skin = 0, skin_bottom = y0;
+	int widths[H], nw = 0;
 	float sx = 0;
 
-	for (int y = y0; y <= band; y++)
+	for (int y = y0; y <= band; y++) {
+		int row = 0;
+
 		for (int x = x0; x <= x1; x++)
 			if (m->skin[y * W + x] > 0.5f && m->person[y * W + x] > 0.3f) {
 				skin++;
+				row++;
 				sx += x;
 				skin_bottom = y;
 			}
+		if (row)
+			widths[nw++] = row;
+	}
 	float head_x, head_h;
 
 	if (skin >= 20) {
 		head_x = sx / skin;
 		head_h = (skin_bottom - y0 + 1) * 1.1f;
+		/*
+		 * A hand at the chin or an open collar stretch the skin down: a
+		 * head is about 1.5 faces wide, and the face is the median skin
+		 * row (in mask rows: the mask is the frame stretched to 4:3).
+		 */
+		if (aspect > 0 && nw >= 3) {
+			for (int i = 1; i < nw; i++)
+				for (int j = i; j > 0 && widths[j - 1] > widths[j]; j--) {
+					int t = widths[j];
+
+					widths[j] = widths[j - 1];
+					widths[j - 1] = t;
+				}
+			float face_w = widths[nw / 2] * aspect * H / W;
+
+			head_h = fminf(head_h, 1.5f * face_w);
+		}
 	} else {
 		/* no face visible: the middle of the person's top 15 % */
 		int top = y0 + (y1 - y0) * 15 / 100, n = 0;
@@ -171,8 +214,9 @@ struct apple_portrait {
 	int *lx0, *lx1, *cx0, *cx1;
 	float *lfx, *cfx;
 	float *r0, *r1, *r2, *r3;
-	uint8_t lut[64][256];              /* Studio Light curve per lift step */
-	float lut_strength;
+	uint8_t lut[64][256];              /* Studio Light curve per light level */
+	float lut_gain;                    /* the key gain the curves are for */
+	float face_luma;                   /* the face's mean luma, smoothed; < 0 = none yet */
 };
 
 /* bilinear taps at quarter-size coordinate q (pixel centres at +0.5) */
@@ -224,7 +268,8 @@ struct apple_portrait *apple_portrait_new(int width, int height)
 		taps((x + 0.5f) / 4, p->qw, &p->lx0[x], &p->lx1[x], &p->lfx[x]);
 	for (int x = 0; x < width / 2; x++)
 		taps((2 * x + 1.0f) / 4, p->qw, &p->cx0[x], &p->cx1[x], &p->cfx[x]);
-	p->lut_strength = -1;
+	p->lut_gain = -1;
+	p->face_luma = -1;
 	return p;
 }
 
@@ -349,15 +394,25 @@ void apple_portrait_refine(struct apple_portrait *p, const struct apple_masks *m
 	float sx = (float)APPLE_SEG_W / w, sy = (float)APPLE_SEG_H / h;
 	float *pp = p->by, *ps = p->bu; /* scratch until blur/light reuse them */
 
+	/*
+	 * The network is unsure (0.3-0.7) on arms, shoulders and clothes that
+	 * look like the background; blending there blurs part of the person.
+	 * Lean those to the person before the edges are fitted to the frame.
+	 */
 	for (int y = 0; y < h; y++)
 		for (int x = 0; x < w; x++) {
-			pp[(size_t)y * w + x] = m->valid ? sample_mask(m->person, (x + 0.5f) * sx, (y + 0.5f) * sy) : 0;
+			float v = m->valid ? sample_mask(m->person, (x + 0.5f) * sx, (y + 0.5f) * sy) : 0;
+
+			pp[(size_t)y * w + x] = smoothstep(0.2f, 0.65f, v);
 			ps[(size_t)y * w + x] = m->valid ? sample_mask(m->skin, (x + 0.5f) * sx, (y + 0.5f) * sy) : 0;
 		}
-	int r = w / 120 > 2 ? w / 120 : 2;
+	int r = w / 160 > 2 ? w / 160 : 2;
 
 	guided(p, pp, p->alpha, r, 1e-3f);
 	guided(p, ps, p->skin, r, 1e-3f);
+	/* the guided fit leaves a soft ramp inside the edge: firm up the inside */
+	for (size_t i = 0; i < (size_t)w * h; i++)
+		p->alpha[i] = smoothstep(0.05f, 0.85f, p->alpha[i]);
 }
 
 /* the quarter-size row at quarter-size coordinate qy, interpolated vertically */
@@ -479,67 +534,139 @@ void apple_portrait_blur(struct apple_portrait *p, struct cdn_frame *f, float st
 	}
 }
 
+/*
+ * Studio Light, after the structure of Portrait.framework's PTSyntheticLight
+ * (names in its default.metallib: face exposure statistics with target
+ * medians and a boost limit, a light mask around the face and body with a
+ * penumbra, a gain map applied to the picture, the background dimmed with a
+ * vignette). The numbers are ours, tuned by eye, not Apple's:
+ *  - the face is brought towards a mean luma of 0.5 (SRLv2's TargetMedian
+ *    0.47-0.53 in Portrait's still-photo tuning plist; an inference for
+ *    video), by at most +55 % luma at full strength, and always by at least
+ *    +8 % (the key light);
+ *  - the light falls off smoothly from the face over the upper body and is
+ *    cut by a widely feathered person mask, so it has no edge;
+ *  - the background is dimmed by at most 18 %, a little more at the
+ *    picture's edges, and desaturated a little;
+ *  - highlights roll off instead of clipping.
+ * The face statistics are smoothed over about half a second.
+ */
+#define LIGHT_TARGET 0.5f
+#define LIGHT_MAX_BOOST 0.55f
+#define LIGHT_MIN_BOOST 0.08f
+#define LIGHT_BG_DIM 0.18f
+
+/* y * g, rolled off towards 1: identity at g = 1, f(1) = 1, monotonic for g <= 2 */
+static float light_curve(float y, float g)
+{
+	return y * g / (1 + (g - 1) * y * y);
+}
+
 void apple_portrait_light(struct apple_portrait *p, struct cdn_frame *f,
 			  const struct apple_subject *s, float strength)
 {
 	int w = p->qw, h = p->qh;
+	size_t n = (size_t)w * h;
 	float k = clampf(strength, 0, 1);
-	float dim = 0.35f * k;
-	float *light = p->t0;
+	float *light = p->t0, *soft = p->t1, *tmp = p->t4, *bg = p->t2;
+	bool head = s && s->present;
 
 	if (k <= 0)
 		return;
-	/* the fill curve y' = 1 - (1 - y)^(1 + 1.5 L): lifts the face, spares highlights */
-	if (p->lut_strength != k) {
+	/* the face's mean luma: skin inside the person, in the head's box */
+	if (head) {
+		int hx0 = clampi((int)((s->head_x - s->head_h * 0.6f * h / w) * w), 0, w - 1);
+		int hx1 = clampi((int)((s->head_x + s->head_h * 0.6f * h / w) * w), 0, w - 1);
+		int hy0 = clampi((int)(s->head_top * h), 0, h - 1);
+		int hy1 = clampi((int)((s->head_top + s->head_h) * h), 0, h - 1);
+		float sum = 0, wsum = 0;
+
+		for (int y = hy0; y <= hy1; y++)
+			for (int x = hx0; x <= hx1; x++) {
+				size_t o = (size_t)y * w + x;
+				float wt = p->skin[o] * p->alpha[o];
+
+				sum += wt * p->guide[o];
+				wsum += wt;
+			}
+		if (wsum > 4) {
+			float m = sum / wsum;
+
+			p->face_luma = p->face_luma < 0 ? m : p->face_luma + 0.07f * (m - p->face_luma);
+		}
+	}
+	float boost = LIGHT_MIN_BOOST;
+
+	if (p->face_luma > 0.02f)
+		boost = clampf(LIGHT_TARGET / p->face_luma - 1, LIGHT_MIN_BOOST, LIGHT_MAX_BOOST);
+	float g = 1 + k * boost;
+
+	if (fabsf(g - p->lut_gain) > 0.004f) {
 		for (int l = 0; l < 64; l++) {
-			float e = 1 + 1.5f * k * l / 63.0f;
+			float gl = 1 + (g - 1) * l / 63.0f;
 
 			for (int y = 0; y < 256; y++)
-				p->lut[l][y] = (uint8_t)clampi((int)lroundf(255 * (1 - powf(1 - y / 255.0f, e))), 0, 255);
+				p->lut[l][y] = (uint8_t)clampi((int)lroundf(255 * light_curve(y / 255.0f, gl)), 0, 255);
 		}
-		p->lut_strength = k;
+		p->lut_gain = g;
 	}
-	/* key light: the skin, plus a soft falloff around the head */
-	float hx = 0, hy = 0, sig = 1;
-	bool head = s && s->present;
+	/* the person, feathered wide: no edge in the light or the dimming */
+	int fr = w / 64 > 2 ? w / 64 : 2;
+
+	box(p->alpha, soft, tmp, w, h, fr);
+	box(soft, soft, tmp, w, h, fr);
+	box(soft, soft, tmp, w, h, fr);
+	/* the light: the face most, falling off over the shoulders (an ellipse
+	 * a little taller than wide, centred below the eyes) */
+	float hx = 0, hy = 0, rx = 1, ry = 1;
 
 	if (head) {
 		hx = s->head_x * w;
-		hy = (s->head_top + s->head_h / 2) * h;
-		sig = fmaxf(1.3f * s->head_h * h, 2);
+		hy = (s->head_top + 0.6f * s->head_h) * h;
+		ry = fmaxf(1.6f * s->head_h * h, 2);
+		rx = fmaxf(ry * 1.1f, 2);
 	}
 	for (int y = 0; y < h; y++)
 		for (int x = 0; x < w; x++) {
 			size_t o = (size_t)y * w + x;
-			float fall = 0;
+			float fall = 0.35f;
 
 			if (head) {
-				float dx = x + 0.5f - hx, dy = y + 0.5f - hy;
+				float dx = (x + 0.5f - hx) / rx, dy = (y + 0.5f - hy) / ry;
 
-				fall = expf(-(dx * dx + dy * dy) / (2 * sig * sig));
+				fall = 0.35f + 0.65f * expf(-(dx * dx + dy * dy));
 			}
-			light[o] = clampf(p->alpha[o] * (0.6f * p->skin[o] + 0.4f * fall), 0, 1);
+			light[o] = clampf(soft[o] * fall, 0, 1);
+			/* the background: dimmer towards the edges (r^2 = 1 in the corners) */
+			float vx = (x + 0.5f) / w - 0.5f, vy = (y + 0.5f) / h - 0.5f;
+			float vig = 0.7f + 0.6f * (vx * vx + vy * vy);
+
+			bg[o] = 1 - k * LIGHT_BG_DIM * vig * (1 - soft[o]);
 		}
+	(void)n;
 	for (int y = 0; y < f->height; y++) {
 		uint8_t *row = f->y + (size_t)y * f->stride_y;
 		float qy = (y + 0.5f) / 4;
 
 		vrow(light, w, h, qy, p->r0);
-		vrow(p->alpha, w, h, qy, p->r1);
+		vrow(bg, w, h, qy, p->r1);
 		for (int x = 0; x < f->width; x++) {
-			float l = hs(p->r0, p->lx0, p->lx1, p->lfx, x), a = hs(p->r1, p->lx0, p->lx1, p->lfx, x);
+			float l = hs(p->r0, p->lx0, p->lx1, p->lfx, x), d = hs(p->r1, p->lx0, p->lx1, p->lfx, x);
 			int v = p->lut[clampi((int)(l * 63 + 0.5f), 0, 63)][row[x]];
 
-			row[x] = u8(v * (1 - dim * (1 - a)));
+			row[x] = u8(v * d);
 		}
 	}
+	/* colour: a lit face keeps its saturation, the background loses a little */
 	for (int y = 0; y < f->height / 2; y++) {
 		uint8_t *row = f->uv + (size_t)y * f->stride_uv;
 		float qy = (2 * y + 1.0f) / 4;
 
-		vrow(p->alpha, w, h, qy, p->r0);
+		vrow(light, w, h, qy, p->r0);
+		vrow(bg, w, h, qy, p->r1);
 		for (int x = 0; x < f->width / 2; x++) {
-			float a = hs(p->r0, p->cx0, p->cx1, p->cfx, x), sat = 1 - 0.5f * dim * (1 - a);
+			float l = hs(p->r0, p->cx0, p->cx1, p->cfx, x), d = hs(p->r1, p->cx0, p->cx1, p->cfx, x);
+			float sat = (1 + 0.5f * (g - 1) * l) * d;
 
 			row[2 * x] = u8(128 + (row[2 * x] - 128) * sat);
 			row[2 * x + 1] = u8(128 + (row[2 * x + 1] - 128) * sat);

@@ -13,6 +13,7 @@
 struct cdn_gain {
 	int fd;
 	bool have_gain, have_exposure;
+	uint32_t gain_id;	/* V4L2_CID_GAIN, or V4L2_CID_ANALOGUE_GAIN */
 };
 
 /* Open path for controls only (never streams). false if no gain control. */

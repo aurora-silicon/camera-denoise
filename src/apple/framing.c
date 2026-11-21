@@ -12,8 +12,14 @@
  * 2 (horizontal), 2.5 (vertical), 1 (zoom in), 2 (zoom out); acceleration
  * multipliers 1.5, 1.5, 1; ease-in 2.5 / 3.75 / 1; recentring after 5 s still
  * over 1.5 s; nobody for 5 s: home over 5 s; heads under 1.5 % are ignored;
- * moves under 0.2 of the head are "still". face_fov puts a head 0.15 of the
- * frame high (the usual distance from a laptop) at the default viewport.
+ * moves under 0.2 of the head are "still".
+ *
+ * Ours, not Apple's: face_fov and max_fov. The plist's viewport is a share of
+ * the sensor's width; the Linux frame is a 16:9 crop of that width, so a head
+ * at laptop distance is 0.3-0.45 of the frame high. face_fov 2 puts a 0.34
+ * head at the default viewport; one person is never framed wider than
+ * max_fov, so there is always room to follow them (2026-11-21: with 4.5 and
+ * no cap the viewport grew to the whole frame and Center Stage stopped).
  */
 void apple_framing_params_default(struct apple_framing_params *p)
 {
@@ -28,7 +34,7 @@ void apple_framing_params_default(struct apple_framing_params *p)
 		.recenter_idle_s = 5.0f, .recenter_s = 1.5f,
 		.no_subject_wait_s = 5.0f, .no_subject_return_s = 5.0f,
 		.tiny_head = 0.015f, .movement_tolerance = 0.2f,
-		.face_fov = 4.5f,
+		.face_fov = 2.0f, .max_fov = 0.8f,
 	};
 }
 
@@ -95,7 +101,7 @@ static struct apple_viewport wanted(const struct apple_framing *f, const struct 
 			size = fmaxf(size, (s->x1 - s->x0) / f->p.group_width);
 		/* never cut the head: it and the offset above it fit */
 		size = fmaxf(size, s->head_h / (1.0f - f->p.top_offset - 0.2f));
-		size = clampf(size, f->p.min_fov, 1.0f);
+		size = clampf(size, f->p.min_fov, s->people > 1 ? 1.0f : f->p.max_fov);
 	}
 	v.size = size;
 	v.cx = s->people > 1 ? (s->x0 + s->x1) / 2 : s->head_x;
