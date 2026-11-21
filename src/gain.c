@@ -60,10 +60,11 @@ void cdn_gain_close(struct cdn_gain *g)
 	g->fd = -1;
 }
 
-int cdn_v4l2_set_exposure_priority(const char *path, bool on)
+int cdn_v4l2_set_exposure_priority(const char *path, bool on, int *prev)
 {
 	struct v4l2_queryctrl q = { .id = V4L2_CID_EXPOSURE_AUTO_PRIORITY };
 	struct v4l2_control c = { .id = V4L2_CID_EXPOSURE_AUTO_PRIORITY, .value = on };
+	struct v4l2_control old = { .id = V4L2_CID_EXPOSURE_AUTO_PRIORITY };
 	int fd, err = 0;
 
 	if (!path || !*path)
@@ -74,8 +75,12 @@ int cdn_v4l2_set_exposure_priority(const char *path, bool on)
 	if (ioctl(fd, VIDIOC_QUERYCTRL, &q) ||
 	    (q.flags & (V4L2_CTRL_FLAG_DISABLED | V4L2_CTRL_FLAG_READ_ONLY)))
 		err = -ENOTTY;
+	else if (prev && ioctl(fd, VIDIOC_G_CTRL, &old))
+		err = -errno;
 	else if (ioctl(fd, VIDIOC_S_CTRL, &c))
 		err = -errno;
+	else if (prev)
+		*prev = old.value;
 	close(fd);
 	return err;
 }

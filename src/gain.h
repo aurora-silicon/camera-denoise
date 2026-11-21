@@ -24,9 +24,10 @@ void cdn_gain_close(struct cdn_gain *g);
 /*
  * Let auto exposure lower the frame rate in low light (V4L2_CID_EXPOSURE_AUTO_PRIORITY),
  * as macOS lets the built-in camera drop to 15 fps. Must be set before the device
- * streams. Returns 0, or -errno (no such control, device busy, no permission).
+ * streams. If prev is not NULL it gets the value the control had before.
+ * Returns 0, or -errno (no such control, device busy, no permission).
  */
-int cdn_v4l2_set_exposure_priority(const char *path, bool on);
+int cdn_v4l2_set_exposure_priority(const char *path, bool on, int *prev);
 
 /*
  * Luma noise from frame to frame, in 8-bit code values (a std-like scale):
