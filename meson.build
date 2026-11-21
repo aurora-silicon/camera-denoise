@@ -103,8 +103,10 @@ if host_machine.system() == 'linux' and cc.compiles('_Float16 h = 1.0f; int main
   # on the Neural Engine (src/apple), loaded instead of the companion plugin
   # when the networks are installed.
   apple_src = files('src/apple/ane_prog.c', 'src/apple/framing.c', 'src/apple/portrait.c')
+  # Per-pixel work on every frame: let the compiler vectorize it whatever the
+  # distribution's build type (-O2 left the J815 at ~3x the -O2 clang time).
   apple_fx = shared_module('aurora-camera-effects-apple', 'src/apple/apple_effects.c', apple_src, 'src/zoom.c',
-    gnu_symbol_visibility : 'hidden', dependencies : m,
+    gnu_symbol_visibility : 'hidden', dependencies : m, c_args : ['-O3'],
     install : true, install_dir : backenddir)
   test('apple', executable('test_apple', 'tests/test_apple.c', apple_src, dependencies : m))
   test('apple-plugin', executable('test_apple_plugin', 'tests/test_apple_plugin.c', dependencies : dl),

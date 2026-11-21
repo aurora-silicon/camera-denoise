@@ -209,11 +209,9 @@ struct apple_portrait {
 	float *guide, *alpha, *skin;       /* qw x qh */
 	float *t0, *t1, *t2, *t3, *t4;     /* scratch, qw x qh */
 	float *by, *bu, *bv;               /* blurred background, qw x qh */
-	/* upsampling to the frame: per column the two quarter-size taps and the
-	 * weight (luma columns, then chroma columns), and four quarter-size rows */
-	int *lx0, *lx1, *cx0, *cx1;
-	float *lfx, *cfx;
+	/* four quarter-size rows (vertical interpolation) */
 	float *r0, *r1, *r2, *r3;
+	float *f0, *f1, *f2;               /* full-width rows */
 	uint8_t lut[64][256];              /* Studio Light curve per light level */
 	float lut_gain;                    /* the key gain the curves are for */
 	float face_luma;                   /* the face's mean luma, smoothed; < 0 = none yet */
@@ -249,25 +247,17 @@ struct apple_portrait *apple_portrait_new(int width, int height)
 			return NULL;
 		}
 	}
-	p->lx0 = calloc((size_t)width, sizeof(int));
-	p->lx1 = calloc((size_t)width, sizeof(int));
-	p->lfx = calloc((size_t)width, sizeof(float));
-	p->cx0 = calloc((size_t)width / 2 + 1, sizeof(int));
-	p->cx1 = calloc((size_t)width / 2 + 1, sizeof(int));
-	p->cfx = calloc((size_t)width / 2 + 1, sizeof(float));
 	p->r0 = calloc((size_t)p->qw, sizeof(float));
 	p->r1 = calloc((size_t)p->qw, sizeof(float));
 	p->r2 = calloc((size_t)p->qw, sizeof(float));
 	p->r3 = calloc((size_t)p->qw, sizeof(float));
-	if (!p->lx0 || !p->lx1 || !p->lfx || !p->cx0 || !p->cx1 || !p->cfx ||
-	    !p->r0 || !p->r1 || !p->r2 || !p->r3) {
+	p->f0 = calloc((size_t)width + 4, sizeof(float));
+	p->f1 = calloc((size_t)width + 4, sizeof(float));
+	p->f2 = calloc((size_t)width + 4, sizeof(float));
+	if (!p->r0 || !p->r1 || !p->r2 || !p->r3 || !p->f0 || !p->f1 || !p->f2) {
 		apple_portrait_free(p);
 		return NULL;
 	}
-	for (int x = 0; x < width; x++)
-		taps((x + 0.5f) / 4, p->qw, &p->lx0[x], &p->lx1[x], &p->lfx[x]);
-	for (int x = 0; x < width / 2; x++)
-		taps((2 * x + 1.0f) / 4, p->qw, &p->cx0[x], &p->cx1[x], &p->cfx[x]);
 	p->lut_gain = -1;
 	p->face_luma = -1;
 	return p;
@@ -280,8 +270,8 @@ void apple_portrait_free(struct apple_portrait *p)
 	free(p->guide); free(p->alpha); free(p->skin);
 	free(p->t0); free(p->t1); free(p->t2); free(p->t3); free(p->t4);
 	free(p->by); free(p->bu); free(p->bv);
-	free(p->lx0); free(p->lx1); free(p->lfx); free(p->cx0); free(p->cx1); free(p->cfx);
 	free(p->r0); free(p->r1); free(p->r2); free(p->r3);
+	free(p->f0); free(p->f1); free(p->f2);
 	free(p);
 }
 
@@ -452,14 +442,40 @@ static void vrow(const float *q, int w, int h, float qy, float *out)
 		out[x] = a[x] + (b[x] - a[x]) * fy;
 }
 
-static inline float hs(const float *row, const int *x0, const int *x1, const float *fx, int i)
+/*
+ * Quarter size to full width with the fixed bilinear phases of a 4x (luma)
+ * or 2x (chroma) upsampling: the same values as taps() + hs(), without the
+ * per-pixel index tables, so the blend loops after them vectorize.
+ * Luma pixel 4i + k sits at quarter coordinate i + (2k - 3) / 8; chroma
+ * pixel 2i + k at i + (2k - 1) / 4. Edges clamp, as taps() does.
+ */
+static void up_luma(const float *q, int qw, float *out, int width)
 {
-	return row[x0[i]] + (row[x1[i]] - row[x0[i]]) * fx[i];
+	for (int i = 0; i < qw; i++) {
+		float c = q[i], l = q[i > 0 ? i - 1 : 0], r = q[i + 1 < qw ? i + 1 : qw - 1];
+		float *o = out + 4 * i;
+
+		o[0] = c + (l - c) * 0.375f;
+		o[1] = c + (l - c) * 0.125f;
+		o[2] = c + (r - c) * 0.125f;
+		o[3] = c + (r - c) * 0.375f;
+	}
+	(void)width;   /* out has room for 4 * qw >= width */
 }
 
-static inline uint8_t u8(float v)
+static void up_chroma(const float *q, int qw, float *out, int cw)
 {
-	return v <= 0 ? 0 : v >= 255 ? 255 : (uint8_t)(v + 0.5f);
+	for (int i = 0; i < qw && 2 * i < cw + 1; i++) {
+		float c = q[i], l = q[i > 0 ? i - 1 : 0], r = q[i + 1 < qw ? i + 1 : qw - 1];
+
+		out[2 * i] = c + (l - c) * 0.25f;
+		out[2 * i + 1] = c + (r - c) * 0.25f;
+	}
+}
+
+static inline uint8_t u8v(float v)
+{
+	return (uint8_t)(fminf(fmaxf(v, 0.0f), 255.0f) + 0.5f);
 }
 
 void apple_portrait_blur(struct apple_portrait *p, struct cdn_frame *f, float strength)
@@ -527,39 +543,37 @@ void apple_portrait_blur(struct apple_portrait *p, struct cdn_frame *f, float st
 		for (size_t i = 0; i < n; i++)
 			pl[i] = den[i] > 1e-3f ? num[i] / den[i] : pl[i];
 	}
-	/* composite at full size: a = person, kept sharp */
+	/* composite at full size: a = person, kept sharp (a > 0.995 counts as 1) */
 	for (int y = 0; y < f->height; y++) {
 		uint8_t *row = f->y + (size_t)y * f->stride_y;
-		float qy = (y + 0.5f) / 4;
+		float qy = (y + 0.5f) / 4, *fa = p->f0, *fb = p->f1;
 
 		vrow(p->alpha, w, h, qy, p->r0);
 		vrow(p->by, w, h, qy, p->r1);
+		up_luma(p->r0, w, fa, f->width);
+		up_luma(p->r1, w, fb, f->width);
 		for (int x = 0; x < f->width; x++) {
-			float a = hs(p->r0, p->lx0, p->lx1, p->lfx, x);
+			float a = fa[x] > 0.995f ? 1.0f : fa[x];
 
-			if (a > 0.995f)
-				continue;
-			float bg = hs(p->r1, p->lx0, p->lx1, p->lfx, x);
-
-			row[x] = u8(a * row[x] + (1 - a) * bg);
+			row[x] = u8v(fb[x] + a * (row[x] - fb[x]));
 		}
 	}
 	for (int y = 0; y < f->height / 2; y++) {
 		uint8_t *row = f->uv + (size_t)y * f->stride_uv;
-		float qy = (2 * y + 1.0f) / 4;
+		float qy = (2 * y + 1.0f) / 4, *fa = p->f0, *fu = p->f1, *fv = p->f2;
+		int cw = f->width / 2;
 
 		vrow(p->alpha, w, h, qy, p->r0);
 		vrow(p->bu, w, h, qy, p->r1);
 		vrow(p->bv, w, h, qy, p->r2);
-		for (int x = 0; x < f->width / 2; x++) {
-			float a = hs(p->r0, p->cx0, p->cx1, p->cfx, x);
+		up_chroma(p->r0, w, fa, cw);
+		up_chroma(p->r1, w, fu, cw);
+		up_chroma(p->r2, w, fv, cw);
+		for (int x = 0; x < cw; x++) {
+			float a = fa[x] > 0.995f ? 1.0f : fa[x];
 
-			if (a > 0.995f)
-				continue;
-			float u = hs(p->r1, p->cx0, p->cx1, p->cfx, x), v = hs(p->r2, p->cx0, p->cx1, p->cfx, x);
-
-			row[2 * x] = u8(a * row[2 * x] + (1 - a) * u);
-			row[2 * x + 1] = u8(a * row[2 * x + 1] + (1 - a) * v);
+			row[2 * x] = u8v(fu[x] + a * (row[2 * x] - fu[x]));
+			row[2 * x + 1] = u8v(fv[x] + a * (row[2 * x + 1] - fv[x]));
 		}
 	}
 }
@@ -676,30 +690,33 @@ void apple_portrait_light(struct apple_portrait *p, struct cdn_frame *f,
 	(void)n;
 	for (int y = 0; y < f->height; y++) {
 		uint8_t *row = f->y + (size_t)y * f->stride_y;
-		float qy = (y + 0.5f) / 4;
+		float qy = (y + 0.5f) / 4, *fl = p->f0, *fd = p->f1;
 
 		vrow(light, w, h, qy, p->r0);
 		vrow(bg, w, h, qy, p->r1);
+		up_luma(p->r0, w, fl, f->width);
+		up_luma(p->r1, w, fd, f->width);
 		for (int x = 0; x < f->width; x++) {
-			float l = hs(p->r0, p->lx0, p->lx1, p->lfx, x), d = hs(p->r1, p->lx0, p->lx1, p->lfx, x);
-			int v = p->lut[clampi((int)(l * 63 + 0.5f), 0, 63)][row[x]];
+			int li = (int)(fminf(fmaxf(fl[x], 0.0f), 1.0f) * 63 + 0.5f);
 
-			row[x] = u8(v * d);
+			row[x] = u8v(p->lut[li][row[x]] * fd[x]);
 		}
 	}
 	/* colour: a lit face keeps its saturation, the background loses a little */
 	for (int y = 0; y < f->height / 2; y++) {
 		uint8_t *row = f->uv + (size_t)y * f->stride_uv;
-		float qy = (2 * y + 1.0f) / 4;
+		float qy = (2 * y + 1.0f) / 4, *fl = p->f0, *fd = p->f1;
+		int cw = f->width / 2;
 
 		vrow(light, w, h, qy, p->r0);
 		vrow(bg, w, h, qy, p->r1);
-		for (int x = 0; x < f->width / 2; x++) {
-			float l = hs(p->r0, p->cx0, p->cx1, p->cfx, x), d = hs(p->r1, p->cx0, p->cx1, p->cfx, x);
-			float sat = (1 + 0.5f * (g - 1) * l) * d;
+		up_chroma(p->r0, w, fl, cw);
+		up_chroma(p->r1, w, fd, cw);
+		for (int x = 0; x < cw; x++) {
+			float sat = (1 + 0.5f * (g - 1) * fl[x]) * fd[x];
 
-			row[2 * x] = u8(128 + (row[2 * x] - 128) * sat);
-			row[2 * x + 1] = u8(128 + (row[2 * x + 1] - 128) * sat);
+			row[2 * x] = u8v(128 + (row[2 * x] - 128) * sat);
+			row[2 * x + 1] = u8v(128 + (row[2 * x + 1] - 128) * sat);
 		}
 	}
 }
