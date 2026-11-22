@@ -59,9 +59,57 @@ the same validation as board data. Reload an instance with SIGHUP after editing
 the config; capabilities update while each stream's effects remain opt-in.
 On a narrower sensor, configure the range to match the available field of view.
 Node properties `camera.framing.supported` and `camera.zoom.min`,
-`camera.zoom.max`, `camera.zoom.default` expose this capability to UIs. No
-framing calibration was taken from private files. Denoise controls and board
+`camera.zoom.max`, `camera.zoom.default` expose this capability to UIs. The
+board data takes no framing calibration from private files (the Neural Engine
+plugin reads its framing tuning from the user's install, see below). Denoise controls and board
 thresholds continue to use their established config.
+
+## Effects on the Neural Engine (Portrait, Studio Light, Center Stage)
+
+On an Apple Silicon Mac whose Neural Engine the Linux `accel/ane` driver runs
+(ABI 3), the effects can use a person and skin segmentation network compiled
+for that Mac's Neural Engine by the user's own macOS install. Nothing of it is
+shipped with this package. `install-apple-effects DIR` installs it (with the
+four driver sections built from it) and the effects' tuning from the same
+install under `/var/lib/aurora-camera-denoise/apple`; the driver checks the
+program when it loads it, on the first ANE node that accepts it. While the
+network is installed the filter loads `libaurora-camera-effects-apple.so`
+instead of the companion plugin (except for background replacement, which this
+plugin does not do).
+
+- `camera.background` `blur`: Portrait-style blur. The masks are refined to the
+  frame with a guided filter and the background is blurred by normalized
+  convolution, so the person does not bleed into it.
+- `camera.studio-light` 0.0–1.0: Studio Light. The face is lifted by a fill
+  curve that spares highlights and the background is dimmed and desaturated.
+- `camera.framing`: Center Stage, a framing session (`src/apple/cf_framing.c`)
+  checked against traces of Center Stage on macOS (35 scenarios: identical
+  framing states, viewports within about 1e-5 rad, 1e-3 at most): face Kalman
+  filters, a face/body tracker, a director, the deadband / drift / recentre /
+  return-home state machine and a rectangle animator. Its tuning is
+  `tuning/framing.conf` from the user's install (`key = value`: deadbands,
+  speeds, accelerations, durations, the default and minimum view, the
+  camera's focal length); without it Center Stage stays off. Its input is
+  one body per person plus a face: the ISP firmware's own detections when the
+  camera driver runs its detector, else from the person and skin masks.
+  Without a face it follows the body. The picture is the session's virtual
+  camera rotated to the viewport, resampled at sub-pixel positions (`warp.c`,
+  4 threads, about 1.5 ms per 1080p frame), with the lens calibration the ISP
+  firmware returns when the camera driver reads it (else a pinhole) and the
+  crop of the ISP preset that gives the frame size.
+- The full-size passes run on the GPU when there is a usable Vulkan device,
+  else on the CPU.
+
+```sh
+pw-cli set-param NODE_ID Props '{ params = [ "camera.studio-light" 0.7 ] }'
+```
+
+Debugging (in the service environment, e.g.
+`systemctl --user set-environment CDN_EFFECTS_DEBUG=mask` then restart):
+`CDN_EFFECTS_DEBUG=mask` shows the refined person mask as the picture;
+`CDN_EFFECTS_DEBUG=stats` prints timings and Center Stage's state every 5 s;
+`CDN_EFFECTS_DEBUG=faces` writes Center Stage's per-frame faces and bodies to
+`$CDN_EFFECTS_DUMP` (or `/tmp`) as `cf-faces-<time>.in`.
 
 ## Optional backend and frame ownership
 
@@ -76,7 +124,9 @@ NV12 buffers. The PipeWire callback copies/submits and takes completed frames;
 it neither allocates model state nor waits for inference. A pending output
 buffer is returned to PipeWire's free pool. A slow worker drops overloaded
 inputs, discards output older than 200 ms and retains original frame timestamps.
-It never combines an old mask with a new image. Ordinary dropped frames preserve time-based tracking; timestamp reversals or gaps
+The companion plugin never combines an old mask with a new image. The Apple
+plugin runs its network at most 15 times a second, as macOS does, and applies
+the newest (time-smoothed) masks to the frames in between. Ordinary dropped frames preserve time-based tracking; timestamp reversals or gaps
 over one second reset it.
 
 Effects run after the existing denoiser and are independent of its gain trigger.

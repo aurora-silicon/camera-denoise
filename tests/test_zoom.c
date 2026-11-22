@@ -54,13 +54,15 @@ int main(void)
 	assert(!strcmp(cdn_zoom_used(z), "none"));
 	cdn_zoom_free(z);
 
-	/* scaler only, without one (a test host): refused, frame unchanged */
-	setenv("CDN_ZOOM_DEVICE", "/nonexistent/video", 1);
+	/* scaler only: without one (a test host) refused with the frame unchanged; with one, used */
 	z = cdn_zoom_new(W, H, CDN_ZOOM_SCALER);
 	assert(z);
 	memset(ybuf, 7, sizeof(ybuf));
-	assert(cdn_zoom_apply(z, &f, cdn_zoom_rect(W, H, 2.0f)) == -ENODEV);
-	assert(ybuf[0] == 7 && ybuf[W * H - 1] == 7);
+	int rs = cdn_zoom_apply(z, &f, cdn_zoom_rect(W, H, 2.0f));
+	if (rs == -ENODEV)
+		assert(ybuf[0] == 7 && ybuf[W * H - 1] == 7);
+	else
+		assert(!rs && !strcmp(cdn_zoom_used(z), "scaler"));
 	cdn_zoom_free(z);
 
 	/* bad sizes */

@@ -28,7 +28,13 @@ bool cdn_gain_open(struct cdn_gain *g, const char *path)
 	g->fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
 	if (g->fd < 0)
 		return false;
+	/* the T8142 ISP reports only the analogue part (dmitzsaz/linux 0fbf1d865b25) */
+	g->gain_id = V4L2_CID_GAIN;
 	g->have_gain = ro_volatile(g->fd, V4L2_CID_GAIN);
+	if (!g->have_gain && ro_volatile(g->fd, V4L2_CID_ANALOGUE_GAIN)) {
+		g->gain_id = V4L2_CID_ANALOGUE_GAIN;
+		g->have_gain = true;
+	}
 	g->have_exposure = ro_volatile(g->fd, V4L2_CID_EXPOSURE_ABSOLUTE);
 	if (!g->have_gain) {
 		close(g->fd);
@@ -39,7 +45,7 @@ bool cdn_gain_open(struct cdn_gain *g, const char *path)
 
 uint32_t cdn_gain_read(struct cdn_gain *g, uint32_t *exposure_us)
 {
-	struct v4l2_control c = { .id = V4L2_CID_GAIN };
+	struct v4l2_control c = { .id = g->gain_id ? g->gain_id : V4L2_CID_GAIN };
 
 	if (exposure_us)
 		*exposure_us = 0;

@@ -155,11 +155,8 @@ static int xioctl(int fd, unsigned long req, void *arg)
 /* The first /dev/video* whose driver is the Apple scaler. */
 static int find_scaler(void)
 {
-	const char *dev = getenv("CDN_ZOOM_DEVICE");
 	char path[64];
 
-	if (dev && *dev)
-		return open(dev, O_RDWR | O_NONBLOCK | O_CLOEXEC);
 	for (int i = 0; i < 64; i++) {
 		struct v4l2_capability cap;
 		int fd;

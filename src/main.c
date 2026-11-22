@@ -248,7 +248,8 @@ static void setup_effects(struct cam *c)
 {
 	cdn_effects_free(c->effects);
 	c->effects = NULL;
-	if (!c->have_fmt || (!c->effect_cfg.background && !c->effect_cfg.framing)) return;
+	if (!c->have_fmt || (!c->effect_cfg.background && !c->effect_cfg.framing &&
+		!(c->effect_cfg.studio_light > 0))) return;
 	const struct cdn_framing_cfg *board = &c->app->cfg.framing;
 	if (c->effect_cfg.framing && !board->supported) {
 		fprintf(stderr, "camera-effects: framing unsupported by this board\n");
@@ -296,6 +297,8 @@ static const struct spa_pod *effect_props(struct cam *c, struct spa_pod_builder 
 	spa_pod_builder_float(b, c->effect_cfg.zoom);
 	spa_pod_builder_string(b, "camera.background.path");
 	spa_pod_builder_string(b, c->effect_cfg.replacement);
+	spa_pod_builder_string(b, "camera.studio-light");
+	spa_pod_builder_float(b, c->effect_cfg.studio_light);
 	spa_pod_builder_pop(b, &values);
 	return spa_pod_builder_pop(b, &object);
 }
@@ -331,11 +334,19 @@ static int set_effect_props(struct cam *c, const struct spa_pod *param)
 		} else if (!strcmp(key, "camera.background.path")) {
 			if (spa_pod_get_string(p, &value) || strlen(value) >= sizeof(next.replacement)) return -EINVAL;
 			snprintf(next.replacement, sizeof(next.replacement), "%s", value);
+		} else if (!strcmp(key, "camera.studio-light")) {
+			/* Studio Light strength 0..1 (Apple plugin) */
+			if (spa_pod_get_float(p, &next.studio_light)) {
+				double d;
+				if (spa_pod_get_double(p, &d)) return -EINVAL;
+				next.studio_light = (float)d;
+			}
 		} else return -EINVAL;
 		key = NULL;
 	}
 	const struct cdn_framing_cfg *board = &c->app->cfg.framing;
 	if (key || !isfinite(next.zoom) || (next.framing && !board->supported) ||
+		!(next.studio_light >= 0 && next.studio_light <= 1) ||
 		(next.zoom != 0 && (next.zoom < board->minimum || next.zoom > board->maximum)) ||
 		(next.background == 2 && !next.replacement[0])) return -EINVAL;
 	if (memcmp(&next, &c->effect_cfg, sizeof(next))) {

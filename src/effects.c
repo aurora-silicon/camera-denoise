@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 #ifndef CDN_BACKEND_DIR
 #define CDN_BACKEND_DIR "/usr/lib/aurora-camera-denoise"
 #endif
@@ -17,7 +18,7 @@ struct slot { uint8_t *data; uint64_t pts, seq, enqueued; };
 struct queue { _Atomic unsigned read, write; struct slot slots[QUEUE]; };
 struct cdn_effects {
 	struct ce_config cfg;
-	const struct ce_ops *ops;
+	const struct ce_ops *ops, *fallback;
 	size_t bytes;
 	struct queue input, output;
 	pthread_t worker;
@@ -30,22 +31,48 @@ static uint64_t now_ns(void)
 	clock_gettime(CLOCK_MONOTONIC, &t);
 	return (uint64_t)t.tv_sec * 1000000000u + (uint64_t)t.tv_nsec;
 }
-static const struct ce_ops *load(void)
+#ifndef CDN_APPLE_DIR
+#define CDN_APPLE_DIR "/var/lib/aurora-camera-denoise/apple"
+#endif
+/* The user's segmentation network is installed (install-apple-effects): use the Neural Engine plugin. */
+static int apple_models(void)
 {
-	static void *library;
-	static const struct ce_ops *ops;
+	return !access(CDN_APPLE_DIR "/segmentation/model.hwx", R_OK);
+}
+static const struct ce_ops *load_one(const char *path, void **library, const struct ce_ops **ops)
+{
 	const struct ce_ops *(*entry)(void);
-	/* Called only on the main loop; keep the Python interpreter DSO resident. */
-	if (ops) return ops;
-	if (!library) library = dlopen(CDN_BACKEND_DIR "/libaurora-camera-effects.so", RTLD_NOW | RTLD_LOCAL | RTLD_NODELETE);
-	if (!library) { fprintf(stderr, "camera-effects: %s\n", dlerror()); return NULL; }
-	*(void **)(&entry) = dlsym(library, CE_ENTRY);
-	ops = entry ? entry() : NULL;
-	if (!ops || ops->abi != CE_ABI || !ops->create || !ops->process || !ops->destroy) {
-		fprintf(stderr, "camera-effects: incompatible plugin\n");
-		ops = NULL;
+	/* Called only on the main loop; keep the plugin (and a Python interpreter DSO) resident. */
+	if (*ops) return *ops;
+	if (!*library) *library = dlopen(path, RTLD_NOW | RTLD_LOCAL | RTLD_NODELETE);
+	if (!*library) { fprintf(stderr, "camera-effects: %s\n", dlerror()); return NULL; }
+	*(void **)(&entry) = dlsym(*library, CE_ENTRY);
+	*ops = entry ? entry() : NULL;
+	if (!*ops || (*ops)->abi != CE_ABI || !(*ops)->create || !(*ops)->process || !(*ops)->destroy) {
+		fprintf(stderr, "camera-effects: incompatible plugin %s\n", path);
+		*ops = NULL;
 	}
-	return ops;
+	return *ops;
+}
+/* The Apple plugin when Apple's networks are installed, except for background
+ * replacement (which it does not do) when the companion plugin can; else the
+ * companion plugin. With the Apple plugin, *fallback is the companion plugin
+ * (when installed), used if the Apple one cannot start: no ANE driver that
+ * loads Apple's programs, e.g. after booting an older kernel. */
+static const struct ce_ops *load(const struct ce_config *cfg, const struct ce_ops **fallback)
+{
+	static void *apple_library, *library;
+	static const struct ce_ops *apple_ops, *ops;
+	static const char apple_path[] = CDN_BACKEND_DIR "/libaurora-camera-effects-apple.so";
+	static const char path[] = CDN_BACKEND_DIR "/libaurora-camera-effects.so";
+	int companion = !access(path, R_OK);
+	*fallback = NULL;
+	if (apple_models() && !(cfg->background == 2 && companion) &&
+		load_one(apple_path, &apple_library, &apple_ops)) {
+		if (companion) *fallback = load_one(path, &library, &ops);
+		return apple_ops;
+	}
+	return load_one(path, &library, &ops);
 }
 static struct cdn_frame frame(struct cdn_effects *s, uint8_t *data)
 {
@@ -56,6 +83,11 @@ static void *work(void *opaque)
 {
 	struct cdn_effects *s = opaque;
 	void *state = s->ops->create(&s->cfg);
+	if (!state && s->fallback) {
+		fprintf(stderr, "camera-effects: first plugin failed to start; using the other one\n");
+		s->ops = s->fallback;
+		state = s->ops->create(&s->cfg);
+	}
 	uint64_t last_pts = 0;
 	int reported = 0;
 	if (!state) fprintf(stderr, "camera-effects: model initialization failed; frames pass through\n");
@@ -98,11 +130,12 @@ struct cdn_effects *cdn_effects_new(const struct ce_config *cfg, const struct ce
 {
 	if (!cfg || cfg->abi != CE_ABI || cfg->width < 2 || cfg->height < 2 ||
 		cfg->width > 4096 || cfg->height > 2160 || ((cfg->width | cfg->height)&1)) return NULL;
-	if (!ops) ops = load();
+	const struct ce_ops *fallback = NULL;
+	if (!ops) ops = load(cfg, &fallback);
 	if (!ops || ops->abi != CE_ABI || !ops->create || !ops->process || !ops->destroy) return NULL;
 	struct cdn_effects *s = calloc(1, sizeof(*s));
 	if (!s) return NULL;
-	s->cfg = *cfg; s->ops = ops;
+	s->cfg = *cfg; s->ops = ops; s->fallback = fallback;
 	s->bytes = (size_t)cfg->width * cfg->height * 3 / 2;
 	atomic_init(&s->stop, 0);
 	atomic_init(&s->input.read, 0); atomic_init(&s->input.write, 0);
