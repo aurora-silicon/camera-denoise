@@ -134,6 +134,16 @@ if host_machine.system() == 'linux' and cc.compiles('_Float16 h = 1.0f; int main
     install : true, install_dir : backenddir)
   test('apple', executable('test_apple', 'tests/test_apple.c', apple_src, dependencies : [m, threads],
     link_with : cf_framing))
+  # Portrait's passes vs the same passes on macOS (CDN_SDOF_REF = a local capture; skips without it).
+  test('apple-sdof', executable('test_sdof', 'tests/test_sdof.c', 'src/apple/sdof.c', dependencies : m,
+    c_args : ['-ffp-contract=off']))
+  # Studio Light's passes vs macOS's (CDN_SL_REF = a local capture, CDN_SL_FACE = its face rect; skips without it).
+  test('apple-studiolight', executable('test_studiolight', 'tests/test_studiolight.c', 'src/apple/studiolight.c',
+    'src/apple/sdof.c', 'src/apple/focus.c', dependencies : m, c_args : ['-ffp-contract=off']))
+  # Studio Light's face exposure statistics vs macOS's (CDN_FEXP_REF = a local capture; skips without it).
+  test('apple-faceexp', executable('test_faceexp', 'tests/test_faceexp.c', 'src/apple/faceexp.c', 'src/apple/tuning.c',
+    'src/apple/studiolight.c',
+    dependencies : m, c_args : ['-ffp-contract=off']))
   test('apple-plugin', executable('test_apple_plugin', 'tests/test_apple_plugin.c', dependencies : dl),
     args : [apple_fx.full_path(), meson.current_build_dir()])
   install_data('tools/install-apple-effects', install_dir : get_option('bindir'),
