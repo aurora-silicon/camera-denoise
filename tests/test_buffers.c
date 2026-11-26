@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 /* Test transport layout and bounds without a PipeWire server or camera. */
+#include <limits.h>
 #include <stdio.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -47,5 +48,38 @@ int main(void)
 	b.n_datas=3; CHECK(!cdn_frame_from_buffer(&b,&fmt,&f)); CHECK(!cdn_frame_dmabuf(&b,&f,&dma));
 	b.n_datas=1; chunks[0].size=432; CHECK(!cdn_frame_from_buffer(&b,&fmt,&f));
 	close(fd);
+
+	/* Output layout: stride rounded to 16, NV12 size, no 32-bit wrap. */
+	int stride = 0;
+	uint32_t size = 0;
+	CHECK(cdn_output_layout(18,18,&stride,&size) && stride==32 && size==32*18+32*9);
+	CHECK(cdn_output_layout(1920,1080,&stride,&size) && stride==1920 && size==1920*1080*3/2);
+	CHECK(cdn_output_layout(CDN_MAX_FRAME_DIM,CDN_MAX_FRAME_DIM,&stride,&size) &&
+	      stride==CDN_MAX_FRAME_DIM && size==(uint32_t)CDN_MAX_FRAME_DIM*CDN_MAX_FRAME_DIM*3/2);
+	CHECK(!cdn_output_layout(CDN_MAX_FRAME_DIM+2,2,&stride,&size));
+	CHECK(!cdn_output_layout(2,CDN_MAX_FRAME_DIM+2,&stride,&size));
+	CHECK(!cdn_output_layout(0,2,&stride,&size) && !cdn_output_layout(2,0,&stride,&size));
+	CHECK(!cdn_output_layout(17,18,&stride,&size) && !cdn_output_layout(18,17,&stride,&size));
+	/* Its real output needs 2^32 + 131072 bytes; 32-bit arithmetic says 131072. */
+	CHECK(!cdn_output_layout(65522,43692,&stride,&size));
+	CHECK(!cdn_output_layout(INT_MAX-1,2,&stride,&size));
+	CHECK(!cdn_output_layout(UINT32_MAX-1,2,&stride,&size));	/* stride rounding wraps */
+	CHECK(!cdn_output_layout(UINT32_MAX-1,UINT32_MAX-1,&stride,&size));
+
+	/* The output mapping must hold the whole frame, computed in 64 bits. */
+	static uint8_t out[32*27];
+	struct spa_data od = {.type=SPA_DATA_MemPtr,.data=out,.maxsize=sizeof(out)};
+	struct cdn_frame o;
+	CHECK(cdn_output_layout(18,18,&stride,&size) && size==sizeof(out));
+	CHECK(cdn_output_frame(&od,18,18,stride,&o));
+	CHECK(o.y==out && o.uv==out+32*18 && o.stride_y==32 && o.stride_uv==32 &&
+	      o.width==18 && o.height==18);
+	od.maxsize=sizeof(out)-1; CHECK(!cdn_output_frame(&od,18,18,stride,&o)); od.maxsize=sizeof(out);
+	od.data=NULL; CHECK(!cdn_output_frame(&od,18,18,stride,&o)); od.data=out;
+	CHECK(!cdn_output_frame(&od,18,18,16,&o));		/* stride below the width */
+	CHECK(!cdn_output_frame(&od,18,18,0,&o));
+	/* A 128 KiB mapping for the wrapping 65522x43692 frame is refused. */
+	od.maxsize=131072;
+	CHECK(!cdn_output_frame(&od,65522,43692,65536,&o));
 	return fails ? 1 : 0;
 }

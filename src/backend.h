@@ -18,6 +18,9 @@
 #include <stdint.h>
 #include <stddef.h>
 
+/* The largest frame width and height any backend takes (the GPU backend's limit). */
+#define CDN_MAX_FRAME_DIM 8192
+
 #define CDN_BACKEND_ABI 1
 #define CDN_BACKEND_ENTRY "cdn_backend_entry"
 

@@ -73,6 +73,32 @@ bool cdn_frame_dmabuf(struct spa_buffer *b, const struct cdn_frame *f,
 	return true;
 }
 
+bool cdn_output_layout(uint32_t width, uint32_t height, int *stride, uint32_t *size)
+{
+	uint64_t s, n;
+
+	if (!width || !height || (width&1) || (height&1) ||
+	    width > CDN_MAX_FRAME_DIM || height > CDN_MAX_FRAME_DIM) return false;
+	s = ((uint64_t)width + 15) & ~(uint64_t)15;
+	n = s*height + s*(height/2);
+	if (s > INT32_MAX || n > INT32_MAX) return false;
+	*stride = (int)s;
+	*size = (uint32_t)n;
+	return true;
+}
+
+bool cdn_output_frame(const struct spa_data *d, uint32_t width, uint32_t height, int stride,
+		      struct cdn_frame *fr)
+{
+	if (!d || !d->data || stride <= 0 || (uint64_t)stride < width ||
+	    !width || !height || width > INT_MAX || height > INT_MAX) return false;
+	uint64_t luma = (uint64_t)stride*height;
+	if ((uint64_t)d->maxsize < luma + (uint64_t)stride*(height/2)) return false;
+	*fr = (struct cdn_frame){ d->data, (uint8_t *)d->data + luma, (int)width, (int)height,
+				  stride, stride };
+	return true;
+}
+
 static bool pod_offers_nv12(const struct spa_pod *p)
 {
 	const struct spa_pod_prop *prop = spa_pod_find_prop(p, NULL, SPA_FORMAT_VIDEO_format);

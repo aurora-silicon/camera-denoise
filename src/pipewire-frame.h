@@ -17,5 +17,18 @@ bool cdn_frame_dmabuf(struct spa_buffer *b, const struct cdn_frame *f,
  * Returns a malloc'd pod, or NULL if the camera format is not NV12.
  */
 struct spa_pod *cdn_output_format(const struct spa_pod *camera);
+/*
+ * The filter's NV12 output layout for a camera size: luma rows of *stride
+ * bytes (the width rounded up to 16), then half as many chroma rows, *size
+ * bytes in all. False for a zero or odd size, one above CDN_MAX_FRAME_DIM,
+ * or a frame whose stride or size does not fit PipeWire's 32-bit Int.
+ */
+bool cdn_output_layout(uint32_t width, uint32_t height, int *stride, uint32_t *size);
+/*
+ * Map the output frame of that layout onto the first data of an output
+ * buffer: false unless its mapping holds the whole frame.
+ */
+bool cdn_output_frame(const struct spa_data *d, uint32_t width, uint32_t height, int stride,
+		      struct cdn_frame *fr);
 bool cdn_format_equal(const struct spa_pod *a, const struct spa_pod *b);
 #endif
