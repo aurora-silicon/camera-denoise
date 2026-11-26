@@ -98,6 +98,7 @@ struct cam {
 	struct spa_video_info_raw fmt; /* negotiated on out */
 	bool have_fmt;
 	int out_stride;
+	uint32_t out_size; /* one NV12 output frame (cdn_output_layout()) */
 
 	/* the temporal stage, or with temporal = off the gated backend */
 	const struct cdn_backend_ops *ops;
@@ -387,14 +388,12 @@ static void on_in_process(void *data)
 	h = (int)c->fmt.size.height;
 
 	struct spa_data *od = &ob->buffer->datas[0];
-	if (!cdn_frame_from_buffer(ib->buffer, &c->fmt, &fi) || !od->data ||
-	    od->maxsize < (uint32_t)c->out_stride * h * 3 / 2) {
+	if (!cdn_frame_from_buffer(ib->buffer, &c->fmt, &fi) ||
+	    !cdn_output_frame(od, c->fmt.size.width, c->fmt.size.height, c->out_stride, &fo)) {
 		pw_stream_queue_buffer(c->in, ib);
 		pw_stream_return_buffer(c->out, ob);
 		return;
 	}
-	fo = (struct cdn_frame){ od->data, (uint8_t *)od->data + (size_t)c->out_stride * h,
-				 w, h, c->out_stride, c->out_stride };
 
 	/* timing and frame rate */
 	ih = spa_buffer_find_meta_data(ib->buffer, SPA_META_Header, sizeof(*ih));
@@ -492,7 +491,7 @@ static void on_in_process(void *data)
 	}
 	od->chunk->offset = 0;
 	od->chunk->stride = c->out_stride;
-	od->chunk->size = ready ? (uint32_t)c->out_stride * h * 3 / 2 : 0;
+	od->chunk->size = ready ? c->out_size : 0;
 	od->chunk->flags = 0;
 	oh = spa_buffer_find_meta_data(ob->buffer, SPA_META_Header, sizeof(*oh));
 	if (oh) {
@@ -755,8 +754,9 @@ static void on_out_param_changed(void *data, uint32_t id, const struct spa_pod *
 	uint8_t buf[1024];
 	struct spa_pod_builder b = SPA_POD_BUILDER_INIT(buf, sizeof(buf));
 	const struct spa_pod *params[2];
-	uint32_t mtype, msub;
+	uint32_t mtype, msub, size;
 	struct spa_video_info_raw r = { 0 };
+	int stride;
 
 	if (id == SPA_PARAM_Props && param) {
 		if (set_effect_props(c, param)) fprintf(stderr, "camera-effects: invalid stream control transaction\n");
@@ -777,9 +777,9 @@ static void on_out_param_changed(void *data, uint32_t id, const struct spa_pod *
 	    msub != SPA_MEDIA_SUBTYPE_raw || spa_format_video_raw_parse(param, &r) < 0 ||
 	    r.format != SPA_VIDEO_FORMAT_NV12 ||
 	    (r.flags & SPA_VIDEO_FLAG_MODIFIER) ||
-	    !r.size.width || !r.size.height ||
-	    (r.size.width & 1) || (r.size.height & 1)) {
-		pw_stream_set_error(c->out, -EINVAL, "only even-sized NV12 is supported");
+	    !cdn_output_layout(r.size.width, r.size.height, &stride, &size)) {
+		pw_stream_set_error(c->out, -EINVAL,
+				    "only even-sized NV12 up to the backends' largest frame is supported");
 		return;
 	}
 	bool changed = !c->have_fmt || memcmp(&r.size, &c->fmt.size, sizeof(r.size)) ||
@@ -787,13 +787,14 @@ static void on_out_param_changed(void *data, uint32_t id, const struct spa_pod *
 			   r.color_matrix != c->fmt.color_matrix || r.color_range != c->fmt.color_range;
 	c->fmt = r;
 	c->have_fmt = true;
-	c->out_stride = SPA_ROUND_UP_N((int)r.size.width, 16);
+	c->out_stride = stride;
+	c->out_size = size;
 
 	params[0] = spa_pod_builder_add_object(&b,
 		SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers,
 		SPA_PARAM_BUFFERS_buffers, SPA_POD_CHOICE_RANGE_Int(4, 2, 8),
 		SPA_PARAM_BUFFERS_blocks, SPA_POD_Int(1),
-		SPA_PARAM_BUFFERS_size, SPA_POD_Int(c->out_stride * (int)r.size.height * 3 / 2),
+		SPA_PARAM_BUFFERS_size, SPA_POD_Int((int)size),
 		SPA_PARAM_BUFFERS_stride, SPA_POD_Int(c->out_stride),
 		SPA_PARAM_BUFFERS_dataType, SPA_POD_CHOICE_FLAGS_Int(
 			(1 << SPA_DATA_MemFd) | (1 << SPA_DATA_MemPtr)));

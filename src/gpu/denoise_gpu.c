@@ -284,7 +284,7 @@ static int init(struct gpu *s)
 static void *gpu_create(int w, int h, int threads)
 {
 	(void)threads;
-	if (w < 16 || h < 16 || (w&1) || (h&1) || w > 8192 || h > 8192) return NULL;
+	if (w < 16 || h < 16 || (w&1) || (h&1) || w > CDN_MAX_FRAME_DIM || h > CDN_MAX_FRAME_DIM) return NULL;
 	struct gpu *s = calloc(1, sizeof(*s));
 	if (!s) return NULL;
 	s->w = w; s->h = h;
